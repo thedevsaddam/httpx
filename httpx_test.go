@@ -18,7 +18,7 @@ func TestToJSONAndHTTPError(t *testing.T) {
 	t.Run("success", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"ok":true}`) }))
 		defer srv.Close()
-		resp, err := New().GET(srv.URL).Send(context.Background())
+		resp, err := New().GET(srv.URL).Do(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -32,7 +32,7 @@ func TestToJSONAndHTTPError(t *testing.T) {
 	t.Run("typed status error", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { http.Error(w, "nope", http.StatusBadRequest) }))
 		defer srv.Close()
-		resp, err := New().GET(srv.URL).Send(context.Background())
+		resp, err := New().GET(srv.URL).Do(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -52,7 +52,7 @@ func TestRequestTimeoutDoesNotCancelBodyBeforeRead(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(WithTimeout(2 * time.Second)).GET(srv.URL).Send(context.Background())
+	resp, err := New(WithTimeout(2 * time.Second)).GET(srv.URL).Do(context.Background())
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestRequestTimeoutDoesNotCancelBodyBeforeRead(t *testing.T) {
 func TestResponseSizeLimit(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { fmt.Fprint(w, `{"payload":"long enough"}`) }))
 	defer srv.Close()
-	resp, err := New(WithMaxResponseBytes(8)).GET(srv.URL).Send(context.Background())
+	resp, err := New(WithMaxResponseBytes(8)).GET(srv.URL).Do(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,55 +80,115 @@ func TestResponseSizeLimit(t *testing.T) {
 }
 
 func TestRetryPolicyAndHooks(t *testing.T) {
-	var requests, requestHooks, responseHooks atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) == 1 {
-			http.Error(w, "try again", http.StatusServiceUnavailable)
-			return
-		}
-		fmt.Fprint(w, `{"ok":true}`)
-	}))
-	defer srv.Close()
-	client := New(
-		WithRetryPolicy(RetryPolicy{MaxAttempts: 2, RetryableStatusCodes: []int{http.StatusServiceUnavailable}, InitialBackoff: time.Millisecond}),
-		WithRequestHook(func(context.Context, *http.Request) { requestHooks.Add(1) }),
-		WithResponseHook(func(context.Context, *http.Response) { responseHooks.Add(1) }),
-	)
-	resp, err := client.GET(srv.URL).Send(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	var requests atomic.Int32
+	var requestHooks atomic.Int32
+	var responseHooks atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			attempt := requests.Add(1)
+
+			if attempt < 3 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("temporarily unavailable"))
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		},
+	))
+	defer server.Close()
+
+	policy := RetryPolicy{
+		MaxAttempts:          3,
+		InitialBackoff:       time.Millisecond,
+		MaxBackoff:           5 * time.Millisecond,
+		RetryableStatusCodes: []int{http.StatusServiceUnavailable},
 	}
-	defer resp.Close()
-	if requests.Load() != 2 || requestHooks.Load() != 2 || responseHooks.Load() != 1 {
-		t.Fatalf("requests=%d requestHooks=%d responseHooks=%d", requests.Load(), requestHooks.Load(), responseHooks.Load())
+
+	client := New(
+		WithRetryPolicy(policy),
+		WithRequestHook(func(ctx context.Context, req *http.Request) {
+			requestHooks.Add(1)
+		}),
+		WithResponseHook(func(ctx context.Context, resp *http.Response) {
+			responseHooks.Add(1)
+		}),
+	)
+
+	resp, err := client.GET(server.URL).Do(context.Background())
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	if string(body) != "ok" {
+		t.Errorf("body = %q, want %q", string(body), "ok")
+	}
+
+	if got := requests.Load(); got != 3 {
+		t.Errorf("requests = %d, want 3", got)
+	}
+
+	if got := requestHooks.Load(); got != 3 {
+		t.Errorf("requestHooks = %d, want 3", got)
+	}
+
+	if got := responseHooks.Load(); got != 3 {
+		t.Errorf("responseHooks = %d, want 3", got)
 	}
 }
 
 func TestStandardRetryPolicyAndJitter(t *testing.T) {
 	policy := StandardRetryPolicy()
-	if policy.MaxAttempts != 3 || !policy.Jitter || !policy.RetryNetworkErrors || !policy.RespectRetryAfter {
+	if policy.MaxAttempts != 3 ||
+		!policy.Jitter ||
+		!policy.RetryNetworkErrors ||
+		!policy.RespectRetryAfter {
 		t.Fatalf("unexpected standard retry policy: %+v", policy)
 	}
-	if got := retryBackoff(policy, 1, nil, time.Now()); got < 0 || got > policy.InitialBackoff {
-		t.Fatalf("first jittered backoff %s outside [0, %s]", got, policy.InitialBackoff)
+
+	got, giveUp := retryDelay(policy, 1, nil, time.Now())
+	if giveUp || got < 0 || got > policy.InitialBackoff {
+		t.Fatalf(
+			"first jittered backoff = %s, giveUp = %t; want [0, %s]",
+			got, giveUp, policy.InitialBackoff,
+		)
 	}
-	if got := retryBackoff(policy, 4, nil, time.Now()); got < 0 || got > policy.MaxBackoff {
-		t.Fatalf("capped jittered backoff %s outside [0, %s]", got, policy.MaxBackoff)
+
+	got, giveUp = retryDelay(policy, 4, nil, time.Now())
+	if giveUp || got < 0 || got > policy.MaxBackoff {
+		t.Fatalf(
+			"capped jittered backoff = %s, giveUp = %t; want [0, %s]",
+			got, giveUp, policy.MaxBackoff,
+		)
 	}
 }
 
 func TestRetryAfterHeader(t *testing.T) {
 	policy := StandardRetryPolicy()
 	resp := &http.Response{Header: make(http.Header)}
+
 	resp.Header.Set("Retry-After", "1")
-	got := retryBackoff(policy, 1, resp, time.Now())
-	if got != time.Second {
-		t.Fatalf("Retry-After delay = %s, want 1s", got)
+	got, giveUp := retryDelay(policy, 1, resp, time.Now())
+	if giveUp || got != time.Second {
+		t.Fatalf("Retry-After delay = %s, giveUp = %t; want 1s", got, giveUp)
 	}
+
 	resp.Header.Set("Retry-After", "10")
-	got = retryBackoff(policy, 1, resp, time.Now())
-	if got != policy.MaxBackoff {
-		t.Fatalf("Retry-After should be capped: got %s, want %s", got, policy.MaxBackoff)
+	got, giveUp = retryDelay(policy, 1, resp, time.Now())
+	if !giveUp {
+		t.Fatalf("Retry-After 10s should give up when MaxBackoff is %s; got delay %s", policy.MaxBackoff, got)
 	}
 }
 
@@ -141,7 +201,7 @@ func TestClientConcurrentRequests(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			resp, err := client.GET(srv.URL).Send(context.Background())
+			resp, err := client.GET(srv.URL).Do(context.Background())
 			if err != nil {
 				t.Errorf("Send: %v", err)
 				return

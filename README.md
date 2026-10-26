@@ -1,33 +1,35 @@
 # httpx 🚀
 
-A small, fluent Go HTTP client built on `net/http` — with typed JSON decoding, tracing, streaming, retries, and configurable connection pooling.
+A small, fluent Go HTTP client built on `net/http` with typed JSON decoding, tracing, streaming, retries, and configurable connection pooling.
 
 [![Go](https://img.shields.io/badge/Go-1.18%2B-00ADD8?logo=go)](https://go.dev/)
 ![Dependencies](https://img.shields.io/badge/dependencies-standard%20library-brightgreen)
 
-## ✨ Features
+## Features
 
-- **Fluent API** — `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, and `OPTIONS`.
-- **Typed JSON** — decode responses with `ToJSON[T]`.
-- **Connection pooling** — use defaults or configure pool limits.
-- **Retry policy** — opt in to bounded retries with backoff.
-- **Request/response hooks** — add metrics, logging, or instrumentation.
-- **Response limits** — protect JSON and error-body helpers from unexpectedly large bodies.
-- **Streaming** — copy large responses to a writer without buffering the whole body.
-- **Typed HTTP errors** — inspect status and a bounded body excerpt with `errors.As`.
-- **Auth and uploads** — built-in Bearer/Basic auth and multipart forms.
-- **Diagnostics** — request logs and connection/timing details via `Debug()` and `Trace()`.
-- **Tracing integration** — inject distributed trace headers through a custom `Tracer`.
+- Fluent builders for `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, and `QUERY`
+- Generic JSON decoding with `ToJSON[T]`
+- Configurable timeout and connection pooling
+- Optional retries with bounded backoff
+- Request and response hooks for instrumentation
+- Bounded response reads and typed `HTTPError` values
+- Streaming response copies with `Response.CopyTo`
+- Bearer and Basic authentication, plus custom auth providers
+- Multipart uploads, custom headers, query parameters, and raw bodies
+- Structured logging and `httptrace`-based request diagnostics
 
-## 📦 Installation
+## Requirements
 
-Use your module path when importing the package:
+- Go 1.22 or newer
+
+## Installation
 
 ```bash
 go get github.com/thedevsaddam/httpx
 ```
 
-## 🚀 Quick start
+
+## Quick start
 
 ```go
 package main
@@ -54,7 +56,7 @@ func main() {
     )
 
     todo, err := httpx.ToJSON[Todo](
-        client.GET("/todos/1").Send(context.Background()),
+        client.GET("/todos/1").Do(context.Background()),
     )
     if err != nil {
         log.Fatal(err)
@@ -64,71 +66,29 @@ func main() {
 }
 ```
 
-## ⚙️ Configure the client
+`ToJSON[T]` decodes a successful JSON response and closes the response body automatically.
 
-Set defaults once when you create the client. Existing options remain available alongside the newer options below.
+## Common request examples
 
-```go
-client := httpx.New(
-    httpx.WithBaseURL("https://api.example.com/v1"),
-    httpx.WithTimeout(10*time.Second),
-    httpx.WithHeader("X-App-Name", "my-service"),
-    httpx.WithAuth(httpx.NewBearerAuth("your-token")),
-    httpx.WithMaxResponseBytes(5 << 20), // 5 MiB for helper reads
-    httpx.WithPoolConfig(httpx.PoolConfig{
-        MaxIdleConns:          100,
-        MaxIdleConnsPerHost:   20,
-        MaxConnsPerHost:       50,
-        IdleConnTimeout:       90 * time.Second,
-        TLSHandshakeTimeout:   10 * time.Second,
-        ResponseHeaderTimeout: 5 * time.Second,
-    }),
-)
-```
-
-### Available client options
-
-| Option | What it does |
-|---|---|
-| `WithBaseURL(url)` | Resolves relative request paths against a base URL. |
-| `WithTimeout(d)` | Sets the default request timeout (30 seconds by default). |
-| `WithHeader(key, value)` | Adds a default header. |
-| `WithQueryParam(key, value)` | Adds a default query parameter. |
-| `WithAuth(auth)` | Sets default authentication. |
-| `WithLogger(logger)` | Enables structured request logging. |
-| `WithTracer(tracer)` | Injects tracing context into outgoing requests. |
-| `WithTransport(transport)` | Uses a custom `*http.Transport`. |
-| `WithHTTPClient(client)` | Uses a custom `*http.Client`. |
-| `WithPoolConfig(cfg)` | Configures standard transport connection-pool limits and timeouts. |
-| `WithMaxResponseBytes(n)` | Limits body reads performed by JSON/error helpers; does not limit manual streaming. |
-| `WithRetryPolicy(policy)` | Enables retries according to a retry policy. |
-| `WithRequestHook(hook)` | Runs a hook immediately before each network attempt. |
-| `WithResponseHook(hook)` | Runs a hook after response headers arrive. |
-| `WithClientName(name)` | Sets the `X-Client-Name` header. |
-
-Pool settings with zero or negative values keep their transport defaults. Pool configuration applies when the client uses a standard `*http.Transport`.
-
-## 📥 GET: query parameters and headers
+### GET with query parameters
 
 ```go
 resp, err := client.GET("/users").
     QueryParam("status", "active").
     QueryParam("limit", "20").
     Header("Accept", "application/json").
-    Send(ctx)
+    Do(ctx)
 if err != nil {
     return err
 }
 defer resp.Close()
 
 if !resp.IsSuccess() {
-    return fmt.Errorf("API returned %s", resp.Status)
+    return fmt.Errorf("request failed: %s", resp.Status)
 }
 ```
 
-`IsSuccess()` returns `true` for status codes in the `2xx` range.
-
-## 📤 POST JSON
+### POST JSON
 
 ```go
 type CreateUser struct {
@@ -144,7 +104,7 @@ type User struct {
 user, err := httpx.ToJSON[User](
     client.POST("/users").
         JSON(CreateUser{Name: "Jane Doe", Email: "jane@example.com"}).
-        Send(ctx),
+        Do(ctx),
 )
 if err != nil {
     return err
@@ -152,72 +112,51 @@ if err != nil {
 fmt.Println("Created user:", user.ID)
 ```
 
-`JSON(v)` marshals `v` and sets `Content-Type: application/json`. Encoding errors are returned by `Send()`.
-
-## 🚦 Handle HTTP errors
-
-`ToJSON[T]` returns an `*HTTPError` for non-2xx responses. The error includes the status code, status text, URL, and a bounded body excerpt.
+### POST URL-encoded form
+Use `Form` to send `application/x-www-form-urlencoded` data, for example when requesting an OAuth token. This is different from Field, which adds a field to a multipart request.
 
 ```go
-user, err := httpx.ToJSON[User](client.GET("/users/123").Send(ctx))
-if err != nil {
-    var httpErr *httpx.HTTPError
-    if errors.As(err, &httpErr) {
-        log.Printf("HTTP %d (%s): %s", httpErr.StatusCode, httpErr.URL, httpErr.Body)
-        return err
-    }
-    return err // network, timeout, or JSON decoding error
-}
-_ = user
-```
-
-
-## 🔁 Retry transient failures
-
-Retries are **opt-in**. `MaxAttempts` includes the initial request. Retries are limited to supported idempotent methods and replayable request bodies; `POST` and other non-idempotent methods are not automatically retried.
-
-```go
-client := httpx.New(
-    httpx.WithRetryPolicy(httpx.RetryPolicy{
-        MaxAttempts:          3,
-        InitialBackoff:       100 * time.Millisecond,
-        MaxBackoff:           time.Second,
-        RetryableStatusCodes: []int{429, 502, 503, 504},
-        RetryNetworkErrors:   true,
-    }),
-)
-```
-
-Use a small attempt count and bounded backoff. Consider your API's rate limits and whether an operation is safe to repeat before enabling retries.
-
-## 🪝 Request and response hooks
-
-Hooks are useful for metrics, request correlation, and lightweight instrumentation.
-
-```go
-client := httpx.New(
-    httpx.WithRequestHook(func(ctx context.Context, req *http.Request) {
-        // Runs before each network attempt.
-        // Example: add a correlation header.
-        req.Header.Set("X-Request-Source", "billing-service")
-    }),
-    httpx.WithResponseHook(func(ctx context.Context, resp *http.Response) {
-        // Runs after response headers arrive.
-        // Example: record resp.StatusCode in your metrics system.
-    }),
-)
-```
-
-Add `"net/http"` to the imports for this example. Hooks can run concurrently; make shared state inside your hook thread-safe.
-
-## 🌊 Stream large responses
-
-`Send()` exposes the response body so you can process it as a stream. `CopyTo` copies the body to a writer and closes it when finished.
-
-```go
-resp, err := client.GET("/exports/archive").Send(ctx)
+resp, err := client.POST("/oauth/token").
+    // DO NOT use both Form and FormValues in a single request
+    // For simple key value style
+    Form(map[string]string{
+        "grant_type":    "client_credentials",
+        "client_id":     "my-client",
+        "client_secret": "my-secret",
+    }).
+    // For repeated values per key.
+    FormValues(url.Values{
+        "grant_type":    "client_credentials",
+        "client_id":     "my-client",
+        "client_secret": "my-secret",
+        "tag":    {"golang", "backend"},
+    }).
+    Do(ctx)
 if err != nil {
     return err
+}
+defer resp.Close()
+
+if !resp.IsSuccess() {
+    return fmt.Errorf("token request failed: %s", resp.Status)
+}
+```
+
+`Form` URL-encodes the values and sets `Content-Type: application/x-www-form-urlencoded`.
+
+
+## Streaming responses
+
+`Send` returns a response whose body can be read directly. Use `CopyTo` to stream a large response to a writer without buffering the entire body in memory:
+
+```go
+resp, err := client.GET("/exports/archive").Do(ctx)
+if err != nil {
+    return err
+}
+if !resp.IsSuccess() {
+    defer resp.Close()
+    return fmt.Errorf("download failed: %s", resp.Status)
 }
 
 file, err := os.Create("archive.zip")
@@ -232,19 +171,21 @@ if _, err := resp.CopyTo(file); err != nil {
 }
 ```
 
-Check `resp.IsSuccess()` or `resp.StatusCode` before saving the body when the endpoint can return an error payload.
+`WithMaxResponseBytes` applies to `ToJSON` and error-body helper reads; it does not limit manual streaming.
 
-`WithMaxResponseBytes` applies to `ToJSON` and error-body helper reads. It does not cap bytes copied manually through `CopyTo`, so streaming remains suitable for large downloads.
-
-## 📎 Multipart and raw bodies
+## Multipart uploads and raw bodies
 
 ### Multipart upload
 
 ```go
 resp, err := client.POST("/upload").
     Field("user_id", "12345").
-    File("avatar", "./avatar.png").
-    Send(ctx)
+    Fields(url.Values{"tag": {"tag-1", "tag-2"}}. // with repetitive values
+    File("avatar", "./avatar.png"). // from file path
+    FileReader("attachments", bytes.NewReader(report), "report.pdf"). // from memory
+    FileReader("attachments", logFile, "app.log"). // from any reader
+    FileReader("attachments", pdfReader, "report.pdf", "application/pdf"). // from reader with content-type
+    Do(ctx)
 if err != nil {
     return err
 }
@@ -255,83 +196,191 @@ if !resp.IsSuccess() {
 }
 ```
 
-The current multipart implementation assembles the payload in memory. For very large uploads, account for that memory usage.
+The current multipart implementation assembles the upload payload in memory. Consider this when uploading large files.
 
-### Raw body
+### Raw request body
 
 ```go
 resp, err := client.POST("/messages").
     Header("Content-Type", "text/plain").
     Body(strings.NewReader("hello" )).
-    Send(ctx)
+    Do(ctx)
 if err != nil {
     return err
 }
 defer resp.Close()
 ```
 
-Add `"strings"` to the imports for this example.
 
-## 🔐 Authentication
+### Handle HTTP errors
+
+When `ToJSON[T]` receives a non-2xx response, it returns an `*httpx.HTTPError`. Use `errors.As` to inspect it:
+
+```go
+user, err := httpx.ToJSON[User](client.GET("/users/123").Do(ctx))
+if err != nil {
+    var httpErr *httpx.HTTPError
+    if errors.As(err, &httpErr) {
+        log.Printf("HTTP %d for %s: %s", httpErr.StatusCode, httpErr.URL, httpErr.Body)
+    }
+    return err
+}
+_ = user
+```
+
+`HTTPError.Body` is a bounded excerpt, not necessarily the full response. Avoid logging it if it could contain secrets or personal information.
+
+## Client configuration
+
+Configure the client once and reuse it across requests:
+
+```go
+client := httpx.New(
+    httpx.WithBaseURL("https://api.example.com/v1"),
+    httpx.WithClientName("billing-service"),
+    httpx.WithTimeout(10*time.Second),
+    httpx.WithHeader("Content-Type", "application/json"),
+    httpx.WithHeader("Accept", "application/json"),
+    httpx.WithAuth(httpx.NewBearerAuth("<YOUR_TOKEN>")),
+    httpx.WithMaxResponseBytes(5 << 20), // 5 MiB for helper reads
+    httpx.WithRetryPolicy(httpx.StandardRetryPolicy()),
+    httpx.WithPoolConfig(httpx.PoolConfig{
+        MaxIdleConns:          100,
+        MaxIdleConnsPerHost:   20,
+        MaxConnsPerHost:       50,
+        IdleConnTimeout:       90 * time.Second,
+        TLSHandshakeTimeout:   10 * time.Second,
+        ResponseHeaderTimeout: 5 * time.Second,
+    }),
+)
+```
+
+### Configuration options
+
+| Option | Description |
+| --- | --- |
+| `WithBaseURL(url)` | Base URL for relative request paths. |
+| `WithTimeout(d)` | Default request timeout; 30 seconds by default. |
+| `WithHeader(key, value)` | Default request header. |
+| `WithQueryParam(key, value)` | Default query parameter. |
+| `WithClientName(name)` | Sets the `X-Client-Name` header. |
+| `WithAuth(auth)` | Default authentication provider. |
+| `WithLogger(logger)` | Structured request logging. |
+| `WithTracer(tracer)` | Injects distributed-tracing context into requests. |
+| `WithPoolConfig(cfg)` | Configures the standard transport's connection pool and timeouts. |
+| `WithMaxResponseBytes(n)` | Maximum body size read by JSON and HTTP-error helpers; default is 10 MiB. |
+| `WithRetryPolicy(policy)` | Enables bounded retries. Retries are disabled by default. |
+| `WithRequestHook(hook)` | Hook called before each network attempt. |
+| `WithResponseHook(hook)` | Hook called after response headers arrive. |
+| `WithTransport(transport)` | Supplies a custom `*http.Transport`. |
+| `WithHTTPClient(client)` | Supplies a custom `*http.Client`. |
+
+For `PoolConfig`, zero values keep the transport defaults. Pool settings apply when the client uses a standard `*http.Transport`.
+
+## Retries
+
+`MaxAttempts` includes the initial request. For a standard policy, use `StandardRetryPolicy()`: three total attempts, retries for network errors and HTTP 429/502/503/504, capped exponential backoff with full jitter, and support for the `Retry-After` header (capped by `MaxBackoff`).
+
+```go
+client := httpx.New(
+    httpx.WithRetryPolicy(httpx.StandardRetryPolicy()),
+)
+```
+
+For a custom policy, set `Jitter: true` to randomize each delay between zero and its exponential backoff cap, and `RespectRetryAfter: true` to honor `Retry-After` on retryable responses:
+
+```go
+client := httpx.New(
+    httpx.WithRetryPolicy(httpx.RetryPolicy{
+        MaxAttempts:          3,
+        InitialBackoff:       100 * time.Millisecond,
+        MaxBackoff:           time.Second,
+        RetryableStatusCodes: []int{429, 502, 503, 504},
+        RetryNetworkErrors:   true,
+        Jitter:               true,
+        RespectRetryAfter:    true,
+    }),
+)
+```
+
+By default, retries are restricted to supported idempotent methods (`GET`, `HEAD`, `OPTIONS`, `DELETE`, and `QUERY`) and replayable request bodies. To explicitly opt a request such as `POST` into the configured retry policy, call `.Retryable()`. The body must be replayable (for example, one set with `.JSON(...)`), and repeating the operation must be safe for your application. 
+For operations that create payments, orders, or other side effects, use a server-supported idempotency key; the client cannot guarantee deduplication by itself.
+
+```go
+resp, err := client.POST("/orders").
+    Header("Idempotency-Key", "order-12345").
+    JSON(payload).
+    Retryable().
+    Do(ctx)
+```
+
+## Hooks
+
+Use hooks for metrics, correlation IDs, or instrumentation:
+
+```go
+client := httpx.New(
+    httpx.WithRequestHook(func(ctx context.Context, req *http.Request) {
+        req.Header.Set("X-Request-Source", "billing-service")
+    }),
+    httpx.WithResponseHook(func(ctx context.Context, resp *http.Response) {
+        // Record status and latency in your metrics system.
+    }),
+)
+```
+
+Hooks may run concurrently, so protect any shared state they access.
+
+## Authentication
 
 ```go
 // Bearer token
 client := httpx.New(httpx.WithAuth(httpx.NewBearerAuth("your-token")))
 
-// Or HTTP Basic authentication
+// Basic authentication
 client = httpx.New(httpx.WithAuth(httpx.NewBasicAuth("username", "password")))
+
+// API key authentication
+client = httpx.New(httpx.WithAuth(httpx.NewAPIKeyAuth("X-API-Key", "your-api-key")))
 ```
 
-You can also implement the `httpx.Auth` interface and apply it to a single request with `.Auth(auth)`.
+You can implement the `httpx.Auth` interface to provide custom authentication. A request can override the client's default with `.Auth(auth)`.
 
-## 🔍 Debugging and tracing
+## Logging and tracing
 
-Enable diagnostics for one request:
+Implement `httpx.Logger` to connect your preferred structured logger:
 
 ```go
-resp, err := client.GET("/health").Debug().Send(ctx)
-if err != nil {
-    return err
-}
-defer resp.Close()
+type MyLogger struct{}
 
-fmt.Println(resp.Debug())
-trace := resp.Trace()
-fmt.Printf("status=%d duration=%s reused=%t\n",
-    trace.StatusCode, trace.TotalTime, trace.IsConnReused)
+func (l *MyLogger) Debug(ctx context.Context, msg string, kv ...any) {}
+func (l *MyLogger) Info(ctx context.Context, msg string, kv ...any)  {}
+func (l *MyLogger) Error(ctx context.Context, msg string, kv ...any) {}
 ```
 
-`Trace()` returns a snapshot with fields such as DNS lookup time, TCP connection time, TLS handshake time, time to first byte, total time to response headers, connection reuse, and remote address. These are best-effort diagnostics; some values can be zero when connections are reused or a proxy is involved. `TotalTime` does not include consuming the response body.
+Implement `httpx.Tracer` to inject tracing headers:
 
-Implement `httpx.Logger` to connect your structured logger, or `httpx.Tracer` to inject your tracing headers. The package does not create spans or define a propagation format for you.
+```go
+type MyTracer struct{}
 
-## 🧵 Concurrency and response lifecycle
+func (t *MyTracer) Inject(ctx context.Context, req *http.Request) {
+    // Inject trace context into req.
+}
+```
 
-- A `Client` is intended to be reused for concurrent requests.
-- Do not mutate a request builder while another goroutine is using it; prefer one builder per request.
-- Hooks and custom `Auth`, `Logger`, and `Tracer` implementations should be safe for concurrent calls.
-- Close response bodies when you consume them directly. `ToJSON[T]` closes the body automatically.
-- `Response.Close()` drains up to 4 KiB before closing to help connection reuse; fully consuming the body is best when practical.
+Call `.Debug()` on an individual request to log timing and connection diagnostics. Read the trace snapshot with `resp.Trace()` or the formatted report with `resp.Debug()`. Trace timings are best-effort and `TotalTime` ends when response headers arrive, not when the body has been fully read.
 
-## 🧭 API cheat sheet
+## Concurrency and response lifecycle
 
-| Call | Purpose |
-|---|---|
-| `httpx.New(options...)` | Create a client. |
-| `client.GET(url)` / `POST` / `PUT` / `PATCH` / `DELETE` | Start a request. `HEAD` and `OPTIONS` are also supported. |
-| `.Header(k, v)` / `.Headers(map)` | Set request headers. |
-| `.QueryParam(k, v)` / `.QueryParams(map)` | Add query parameters. |
-| `.JSON(value)` / `.Body(reader)` | Set request body. |
-| `.Field(k, v)` / `.File(field, path)` | Add multipart form values/files. |
-| `.Auth(auth)` / `.Timeout(d)` | Override request authentication or timeout. |
-| `.Debug()` / `resp.Trace()` / `resp.Debug()` | Inspect request diagnostics. |
-| `.Send(ctx)` | Execute the request. |
-| `resp.IsSuccess()` / `resp.Close()` / `resp.CopyTo(w)` | Check, close, or stream a response. |
-| `httpx.ToJSON[T](resp, err)` | Decode JSON and close the response body. |
+- Reuse a configured client for concurrent requests; the underlying `net/http` client and transport support concurrent use.
+- Build a separate request builder for each concurrent operation. Do not mutate and send the same builder concurrently.
+- Hooks and custom auth, logger, and tracer implementations must be safe for concurrent use if shared by requests.
+- Always close response bodies when reading responses directly. `ToJSON[T]` closes the body automatically.
+- `Response.Close()` closes the body and attempts to drain a small amount to improve connection reuse.
 
-## 🧪 Tests
+## Testing
 
-Run the package tests and race detector from the module root:
+Run the test suite and static checks from the module root:
 
 ```bash
 go test ./...
@@ -339,7 +388,25 @@ go test -race ./...
 go vet ./...
 ```
 
-## Requirements
+## API reference
 
-- Go 1.22 or newer for the module configuration shown here (the package uses Go generics, which require Go 1.18+).
-- Avoid logging credentials, authorization headers, or sensitive query parameters in production.
+| API | Description |
+| --- | --- |
+| `New(options...)` | Creates a client with pooling enabled by default. |
+| `client.GET(url)` / `POST` / `PUT` / `PATCH` / `DELETE` / `HEAD` / `OPTIONS` / `QUERY` | Creates a request builder. |
+| `builder.Header(key, value)` / `Headers(map)` | Sets request headers. |
+| `builder.QueryParam(key, value)` / `QueryParams(map)` | Adds query parameters. |
+| `builder.JSON(value)` | Encodes a JSON request body. |
+| `builder.Body(reader)` | Sets a raw request body. |
+| `builder.File(field, path)` / `Field(key, value)` | Adds multipart fields. |
+| `builder.Auth(auth)` / `Timeout(d)` | Overrides request authentication or timeout. |
+| `builder.Debug()` | Enables request diagnostics. |
+| `builder.Do(ctx)` | Executes the request. |
+| `resp.IsSuccess()` | Reports whether the status code is 2xx. |
+| `resp.CopyTo(writer)` | Streams the response body to a writer and closes it. |
+| `resp.Close()` | Closes the response body. |
+| `resp.Trace()` / `resp.Debug()` | Returns trace information or a formatted report. |
+| `ToJSON[T](resp, err)` | Decodes JSON and closes the response body. |
+
+## License
+The **httpx** is an open-source software licensed under the [MIT License](LICENSE.md).

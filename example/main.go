@@ -99,7 +99,7 @@ func getExample(ctx context.Context, client *httpx.Client) {
 			QueryParam("page", "2").
 			QueryParam("tag", "go").
 			QueryParam("tag", "httpx").
-			Send(ctx),
+			Do(ctx),
 	)
 	if err != nil {
 		log.Printf("GET failed: %v", err)
@@ -117,7 +117,12 @@ func postJSONExample(ctx context.Context, client *httpx.Client) {
 		"roles": []string{"developer", "admin"},
 	}
 	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.POST("/anything/users").JSON(payload).Send(ctx),
+		client.
+			POST("/anything/users").
+			Header("Idempotency-Key", "order-12345").
+			JSON(payload).
+			Retryable().
+			Do(ctx),
 	)
 	if err != nil {
 		log.Printf("POST failed: %v", err)
@@ -132,7 +137,7 @@ func headersExample(ctx context.Context, client *httpx.Client) {
 			Header("X-Request-ID", "demo-123").
 			Header("X-Environment", "local").
 			Timeout(4 * time.Second).
-			Send(ctx),
+			Do(ctx),
 	)
 	if err != nil {
 		log.Printf("Headers example failed: %v", err)
@@ -147,12 +152,12 @@ func methodsExample(ctx context.Context, client *httpx.Client) {
 		method string
 		send   func() (*httpx.Response, error)
 	}{
-		{"PUT", func() (*httpx.Response, error) { return client.PUT("/anything/items/42").JSON(payload).Send(ctx) }},
-		{"PATCH", func() (*httpx.Response, error) { return client.PATCH("/anything/items/42").JSON(payload).Send(ctx) }},
-		{"DELETE", func() (*httpx.Response, error) { return client.DELETE("/anything/items/42").Send(ctx) }},
+		{"PUT", func() (*httpx.Response, error) { return client.PUT("/anything/items/42").JSON(payload).Do(ctx) }},
+		{"PATCH", func() (*httpx.Response, error) { return client.PATCH("/anything/items/42").JSON(payload).Do(ctx) }},
+		{"DELETE", func() (*httpx.Response, error) { return client.DELETE("/anything/items/42").Do(ctx) }},
 	}
 	for _, item := range requests {
-		resp, err := item.send()
+		resp, err := item.Do()
 		if err != nil {
 			log.Printf("%s failed: %v", item.method, err)
 			continue
@@ -164,7 +169,7 @@ func methodsExample(ctx context.Context, client *httpx.Client) {
 
 func httpErrorExample(ctx context.Context, client *httpx.Client) {
 	// /status/404 intentionally returns a non-2xx response.
-	_, err := httpx.ToJSON[HTTPBinResponse](client.GET("/status/404").Send(ctx))
+	_, err := httpx.ToJSON[HTTPBinResponse](client.GET("/status/404").Do(ctx))
 	if err == nil {
 		log.Printf("expected a 404 error, got nil")
 		return
@@ -179,7 +184,7 @@ func httpErrorExample(ctx context.Context, client *httpx.Client) {
 }
 
 func manualResponseExample(ctx context.Context, client *httpx.Client) {
-	resp, err := client.GET("/status/200").Send(ctx)
+	resp, err := client.GET("/status/200").Do(ctx)
 	if err != nil {
 		log.Printf("Manual response failed: %v", err)
 		return
@@ -206,7 +211,7 @@ func streamingExample(ctx context.Context, client *httpx.Client) {
 	defer os.Remove(path)
 	defer file.Close()
 
-	resp, err := client.GET("/bytes/65536").Send(ctx) // 64 KiB test payload.
+	resp, err := client.GET("/bytes/65536").Do(ctx) // 64 KiB test payload.
 	if err != nil {
 		log.Printf("Download request failed: %v", err)
 		return
@@ -225,14 +230,13 @@ func streamingExample(ctx context.Context, client *httpx.Client) {
 }
 
 func debugExample(ctx context.Context, client *httpx.Client) {
-	resp, err := client.GET("/get").QueryParam("debug", "true").Debug().Send(ctx)
+	resp, err := client.GET("/get").QueryParam("debug", "true").Debug().Do(ctx)
 	if err != nil {
 		log.Printf("Debug request failed: %v", err)
 		return
 	}
 	defer resp.Close()
 
-	fmt.Println(resp.Debug())
 	trace := resp.Trace()
 	fmt.Printf("Method=%s status=%d total=%s reused_connection=%t\n",
 		trace.Method, trace.StatusCode, trace.TotalTime, trace.IsConnReused)
@@ -260,7 +264,7 @@ func uploadExample(ctx context.Context, client *httpx.Client) {
 		client.POST("/post").
 			Field("description", "example upload").
 			File("file", path).
-			Send(ctx),
+			Do(ctx),
 	)
 	if err != nil {
 		log.Printf("Upload failed: %v", err)
@@ -274,7 +278,7 @@ func rawBodyExample(ctx context.Context, client *httpx.Client) {
 		client.POST("/anything/raw").
 			Header("Content-Type", "text/plain; charset=utf-8").
 			Body(strings.NewReader("plain text payload from httpx")).
-			Send(ctx),
+			Do(ctx),
 	)
 	if err != nil {
 		log.Printf("Raw body request failed: %v", err)
