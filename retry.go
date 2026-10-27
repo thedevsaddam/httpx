@@ -11,6 +11,108 @@ import (
 	"time"
 )
 
+// RetryPolicy controls retries. MaxAttempts includes the first attempt. A value below 2
+// means no retries. Jitter enables full jitter: each backoff is randomized between zero
+// and the exponential backoff cap. When RespectRetryAfter is set and the server asks for
+// a delay longer than MaxBackoff (when positive), the request is not retried and the
+// response is returned to the caller instead of hammering the server too early.
+type RetryPolicy struct {
+	MaxAttempts          int
+	InitialBackoff       time.Duration
+	MaxBackoff           time.Duration
+	RetryableStatusCodes []int
+	RetryNetworkErrors   bool
+	Jitter               bool
+	RespectRetryAfter    bool
+}
+
+// StandardRetryPolicy returns a conservative policy for common transient failures.
+// It makes up to three total attempts, retries network errors and HTTP 429/502/503/504,
+// uses capped exponential backoff with full jitter, and honors Retry-After when present.
+func StandardRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          3,
+		InitialBackoff:       200 * time.Millisecond,
+		MaxBackoff:           2 * time.Second,
+		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryNetworkErrors:   true,
+		Jitter:               true,
+		RespectRetryAfter:    true,
+	}
+}
+
+// NoRetryPolicy disables retries.
+func NoRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts: 1,
+	}
+}
+
+// FastRetryPolicy is suitable for fast internal API calls.
+func FastRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          2,
+		InitialBackoff:       50 * time.Millisecond,
+		MaxBackoff:           200 * time.Millisecond,
+		RetryableStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryNetworkErrors:   true,
+		Jitter:               true,
+		RespectRetryAfter:    false,
+	}
+}
+
+// AggressiveRetryPolicy retries transient failures more often.
+func AggressiveRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          5,
+		InitialBackoff:       200 * time.Millisecond,
+		MaxBackoff:           5 * time.Second,
+		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryNetworkErrors:   true,
+		Jitter:               true,
+		RespectRetryAfter:    true,
+	}
+}
+
+// BackgroundRetryPolicy is suitable for non-interactive jobs.
+func BackgroundRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          8,
+		InitialBackoff:       time.Second,
+		MaxBackoff:           30 * time.Second,
+		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryNetworkErrors:   true,
+		Jitter:               true,
+		RespectRetryAfter:    true,
+	}
+}
+
+// RateLimitRetryPolicy prioritizes handling HTTP 429 responses.
+func RateLimitRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          4,
+		InitialBackoff:       time.Second,
+		MaxBackoff:           30 * time.Second,
+		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusServiceUnavailable},
+		RetryNetworkErrors:   false,
+		Jitter:               true,
+		RespectRetryAfter:    true,
+	}
+}
+
+// ResilientRetryPolicy is intended for unreliable external APIs.
+func ResilientRetryPolicy() RetryPolicy {
+	return RetryPolicy{
+		MaxAttempts:          5,
+		InitialBackoff:       500 * time.Millisecond,
+		MaxBackoff:           10 * time.Second,
+		RetryableStatusCodes: []int{429, 500, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryNetworkErrors:   true,
+		Jitter:               true,
+		RespectRetryAfter:    true,
+	}
+}
+
 // retryDelay returns how long to wait before the next attempt. giveUp is true when the
 // server's Retry-After exceeds what the policy is willing to wait.
 func retryDelay(policy RetryPolicy, retryNumber int, resp *http.Response, now time.Time) (delay time.Duration, giveUp bool) {

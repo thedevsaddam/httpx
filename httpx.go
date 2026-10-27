@@ -207,33 +207,3 @@ type RequestHook func(context.Context, *http.Request)
 
 // ResponseHook runs after response headers arrive on each attempt. Hooks must be safe for concurrent calls.
 type ResponseHook func(context.Context, *http.Response)
-
-// RetryPolicy controls retries. MaxAttempts includes the first attempt. A value below 2
-// means no retries. Jitter enables full jitter: each backoff is randomized between zero
-// and the exponential backoff cap. When RespectRetryAfter is set and the server asks for
-// a delay longer than MaxBackoff (when positive), the request is not retried and the
-// response is returned to the caller instead of hammering the server too early.
-type RetryPolicy struct {
-	MaxAttempts          int
-	InitialBackoff       time.Duration
-	MaxBackoff           time.Duration
-	RetryableStatusCodes []int
-	RetryNetworkErrors   bool
-	Jitter               bool
-	RespectRetryAfter    bool
-}
-
-// StandardRetryPolicy returns a conservative policy for common transient failures.
-// It makes up to three total attempts, retries network errors and HTTP 429/502/503/504,
-// uses capped exponential backoff with full jitter, and honors Retry-After when present.
-func StandardRetryPolicy() RetryPolicy {
-	return RetryPolicy{
-		MaxAttempts:          3,
-		InitialBackoff:       200 * time.Millisecond,
-		MaxBackoff:           2 * time.Second,
-		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
-		RetryNetworkErrors:   true,
-		Jitter:               true,
-		RespectRetryAfter:    true,
-	}
-}

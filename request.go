@@ -473,6 +473,15 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 			c.requestHook(ctx, attemptReq)
 		}
 		resp, err := c.httpClient.Do(attemptReq)
+
+		if ctx.Err() != nil {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			cancelAttempt()
+			return nil, nil, ctx.Err()
+		}
+
 		if resp != nil && c.responseHook != nil {
 			c.responseHook(ctx, resp)
 		}
@@ -635,7 +644,15 @@ func (c *Client) buildURL(s state) (string, error) {
 		joined := *c.baseURL
 		joined.Path = strings.TrimRight(c.baseURL.Path, "/") + "/" + strings.TrimLeft(ref.Path, "/")
 		joined.RawPath = strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/" + strings.TrimLeft(ref.EscapedPath(), "/")
-		joined.RawQuery = ref.RawQuery
+		q := joined.Query()
+
+		for key, values := range ref.Query() {
+			for _, value := range values {
+				q.Add(key, value)
+			}
+		}
+
+		joined.RawQuery = q.Encode()
 		joined.Fragment = ref.Fragment
 		u = &joined
 	default:

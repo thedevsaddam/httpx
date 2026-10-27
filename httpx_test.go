@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -260,4 +261,183 @@ func TestAuthenticationProviders(t *testing.T) {
 			t.Fatal("expected error for empty API key")
 		}
 	})
+}
+
+func TestRetryHonorsParentContextCancellation(t *testing.T) {
+	var requests atomic.Int32
+	firstRequest := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			if requests.Add(1) == 1 {
+				close(firstRequest)
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+		},
+	))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	client := New(
+		WithTimeout(5*time.Second),
+		WithRetryPolicy(RetryPolicy{
+			MaxAttempts:          5,
+			InitialBackoff:       500 * time.Millisecond,
+			MaxBackoff:           time.Second,
+			RetryableStatusCodes: []int{http.StatusServiceUnavailable},
+		}),
+	)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.GET(server.URL).Do(ctx)
+		done <- err
+	}()
+
+	select {
+	case <-firstRequest:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for first request")
+	}
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error after parent context cancellation")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not stop after parent context cancellation")
+	}
+
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1", got)
+	}
+}
+
+func TestRequestTimeoutWhileReadingBody(t *testing.T) {
+	firstChunk := "first-chunk"
+	secondChunk := "second-chunk"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, firstChunk)
+
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(300 * time.Millisecond):
+		}
+
+		_, _ = io.WriteString(w, secondChunk)
+	}))
+	defer srv.Close()
+
+	client := New(WithTimeout(100 * time.Millisecond))
+
+	resp, err := client.GET(srv.URL).Do(context.Background())
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Close()
+
+	got, err := io.ReadAll(resp.Body)
+
+	// The timeout should expire during the body read.
+	if err == nil {
+		t.Fatalf("expected body read to fail after timeout; got %q", got)
+	}
+}
+
+func TestEachRetryGetsFreshTimeout(t *testing.T) {
+	var requests atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			attempt := requests.Add(1)
+
+			if attempt == 1 {
+				// Do not send response headers before the first
+				// attempt's timeout expires.
+				<-r.Context().Done()
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, "ok")
+		},
+	))
+	defer srv.Close()
+
+	client := New(
+		WithTimeout(100*time.Millisecond),
+		WithRetryPolicy(RetryPolicy{
+			MaxAttempts:        2,
+			InitialBackoff:     10 * time.Millisecond,
+			MaxBackoff:         10 * time.Millisecond,
+			RetryNetworkErrors: true,
+		}),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := client.GET(srv.URL).Do(ctx)
+	if err != nil {
+		t.Fatalf("Do: expected retry to succeed, got %v", err)
+	}
+	defer resp.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
+	}
+	if string(body) != "ok" {
+		t.Fatalf("body = %q, want %q", body, "ok")
+	}
+
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2", got)
+	}
+}
+
+func TestBuildURLMergesBaseAndRequestQueryParams(t *testing.T) {
+	client := New(
+		WithBaseURL("https://api.example.com/v1?tenant=42&lang=en"),
+	)
+
+	got, err := client.buildURL(state{
+		url: "/users?page=2&limit=10",
+	})
+	if err != nil {
+		t.Fatalf("buildURL() error = %v", err)
+	}
+
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("url.Parse() error = %v", err)
+	}
+
+	q := u.Query()
+	for key, want := range map[string]string{
+		"tenant": "42",
+		"lang":   "en",
+		"page":   "2",
+		"limit":  "10",
+	} {
+		if got := q.Get(key); got != want {
+			t.Errorf("query parameter %q = %q, want %q", key, got, want)
+		}
+	}
 }
