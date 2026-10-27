@@ -147,7 +147,7 @@ if !resp.IsSuccess() {
 
 ## Streaming responses
 
-`Send` returns a response whose body can be read directly. Use `CopyTo` to stream a large response to a writer without buffering the entire body in memory:
+`Do` returns a response whose body can be read directly. Use `CopyTo` to stream a large response to a writer without buffering the entire body in memory:
 
 ```go
 resp, err := client.GET("/exports/archive").Do(ctx)
