@@ -150,14 +150,14 @@ func methodsExample(ctx context.Context, client *httpx.Client) {
 	payload := map[string]string{"name": "Updated item"}
 	requests := []struct {
 		method string
-		send   func() (*httpx.Response, error)
+		do     func() (*httpx.Response, error)
 	}{
 		{"PUT", func() (*httpx.Response, error) { return client.PUT("/anything/items/42").JSON(payload).Do(ctx) }},
 		{"PATCH", func() (*httpx.Response, error) { return client.PATCH("/anything/items/42").JSON(payload).Do(ctx) }},
 		{"DELETE", func() (*httpx.Response, error) { return client.DELETE("/anything/items/42").Do(ctx) }},
 	}
 	for _, item := range requests {
-		resp, err := item.Do()
+		resp, err := item.do()
 		if err != nil {
 			log.Printf("%s failed: %v", item.method, err)
 			continue
