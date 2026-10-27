@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -162,7 +163,7 @@ func (rb *RequestBuilder) Body(body io.Reader) *RequestBuilder {
 	return rb
 }
 
-// JSON encodes v as JSON. Encoding errors are returned by Send rather than hidden in the body.
+// JSON encodes v as JSON. Encoding errors are returned by Do rather than hidden in the body.
 // HTML characters (<, >, &) are not escaped.
 func (rb *RequestBuilder) JSON(v any) *RequestBuilder {
 	rb.mu.Lock()
@@ -215,7 +216,7 @@ func (rb *RequestBuilder) File(fieldName, filePath string) *RequestBuilder {
 // using filename as the uploaded file name. It can be called multiple times and combined
 // with File and Field.
 //
-// The reader is consumed once, when Send builds the multipart body; the body is buffered
+// The reader is consumed once, when Do builds the multipart body; the body is buffered
 // in memory so retries can replay it. The caller keeps ownership of r and must close it
 // if it is an io.Closer. Because r is consumed, a builder with FileReader cannot be
 // Sent a second time unless the reader is reset by the caller.
@@ -291,7 +292,8 @@ func (rb *RequestBuilder) IdempotencyKey(key string) *RequestBuilder {
 	return rb
 }
 
-// Timeout overrides the client-level timeout for this request. It covers all retry attempts.
+// Timeout overrides the client-level timeout for this request.
+// It applies to each attempt separately; the caller's context still bounds the whole call.
 func (rb *RequestBuilder) Timeout(timeout time.Duration) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -316,8 +318,10 @@ func methodRetryable(method string, explicit bool) bool {
 	return explicit
 }
 
-// Send executes the request and returns the response. The caller must close the response body.
-// The request timeout covers every attempt, and stays active until the body is closed.
+// Do executes the request and returns the response. The caller must close the response body.
+// The request timeout applies to each attempt separately (a 10s timeout gives every retry its
+// own 10s), and for the final attempt it stays active until the body is closed. The caller's
+// ctx still bounds the whole call, including backoff waits.
 func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -346,26 +350,15 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		s.headers.Set(headerContentType, multipartCT)
 	}
 
-	// Keep the per-request timeout alive until the response body is closed.
-	var cancel context.CancelFunc
-	if s.timeout > 0 {
-		ctx, cancel = context.WithTimeout(ctx, s.timeout)
-	}
-	fail := func(err error) (*Response, error) {
-		if cancel != nil {
-			cancel()
-		}
-		return nil, err
-	}
-
+	// ctx is the caller's context only; the per-attempt timeout is applied in doWithRetry.
 	req, err := http.NewRequestWithContext(ctx, s.method, fullURL, bodyReader)
 	if err != nil {
-		return fail(fmt.Errorf("httpx: failed to create request: %w", err))
+		return nil, fmt.Errorf("httpx: failed to create request: %w", err)
 	}
 	req.Header = s.headers
 	if s.auth != nil {
 		if err := s.auth.Apply(req); err != nil {
-			return fail(fmt.Errorf("httpx: failed to apply auth: %w", err))
+			return nil, fmt.Errorf("httpx: failed to apply auth: %w", err)
 		}
 	}
 	if c.tracer != nil {
@@ -383,7 +376,9 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		c.logger.Debug(ctx, "HTTP request started", "method", req.Method, "url", safeURL)
 	}
 
-	resp, err := rb.doWithRetry(ctx, req, s, trace)
+	// cancel belongs to the final attempt's timeout context (nil when no timeout is set).
+	// On error, doWithRetry has already cancelled it.
+	resp, cancel, err := rb.doWithRetry(ctx, req, s, trace)
 
 	trace.mu.Lock()
 	trace.TotalTime = time.Since(start)
@@ -396,8 +391,10 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	trace.mu.Unlock()
 
 	if err != nil {
-		if cancel != nil {
-			cancel()
+		// *url.Error embeds the raw URL (including the query string); swap in the redacted one.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			ue.URL = safeURL
 		}
 		if c.logger != nil {
 			c.logger.Error(ctx, "HTTP request failed", "method", req.Method, "url", safeURL, "error", err, "duration", time.Since(start))
@@ -408,12 +405,15 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		return nil, fmt.Errorf("httpx: request execution failed: %w", err)
 	}
 	// A 101 body is a writable stream (WebSocket etc.); wrapping it would hide io.Writer.
-	if cancel != nil && resp.Body != nil {
-		if resp.StatusCode == http.StatusSwitchingProtocols {
-			// The caller owns the connection now; the context must not outlive the call.
-			// Not cancelling here: cancelling would tear the upgraded connection down.
+	if cancel != nil {
+		switch {
+		case resp.Body == nil:
+			cancel()
+		case resp.StatusCode == http.StatusSwitchingProtocols:
+			// The caller owns the connection now. Don't cancel: that would tear down
+			// the upgraded connection. The timer is released when the deadline passes.
 			_ = cancel
-		} else {
+		default:
 			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 		}
 	}
@@ -426,8 +426,11 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	return &Response{Response: resp, trace: trace, maxBodyBytes: c.maxResponseBytes, method: req.Method, safeURL: safeURL}, nil
 }
 
-// doWithRetry runs the attempt loop. On a non-nil error the returned response is nil.
-func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s state, trace *TraceInfo) (*http.Response, error) {
+// doWithRetry runs the attempt loop. Every attempt gets its own s.timeout. On a non-nil error
+// the returned response and cancel are nil (any attempt context is already cancelled). On
+// success the returned cancel belongs to the returned response's attempt and must be called
+// when its body is closed.
+func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s state, trace *TraceInfo) (*http.Response, context.CancelFunc, error) {
 	c := rb.client
 	policy := c.retryPolicy
 	maxAttempts := policy.MaxAttempts
@@ -439,22 +442,32 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 		maxAttempts = 1
 	}
 
+	var lastErr error
+
 	for attempt := 1; ; attempt++ {
 		trace.mu.Lock()
 		trace.RequestAttempt = attempt
 		trace.mu.Unlock()
 
-		attemptReq := req
-		if attempt > 1 {
-			// Clone with the request's own context so the httptrace hooks survive.
-			attemptReq = req.Clone(req.Context())
-			if req.GetBody != nil {
-				body, err := req.GetBody()
-				if err != nil {
-					return nil, fmt.Errorf("httpx: failed to recreate request body for retry: %w", err)
-				}
-				attemptReq.Body = body
+		attemptCtx := req.Context()
+		var cancel context.CancelFunc
+		if s.timeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(attemptCtx, s.timeout)
+		}
+		cancelAttempt := func() {
+			if cancel != nil {
+				cancel()
 			}
+		}
+
+		attemptReq := req.Clone(attemptCtx)
+		if attempt > 1 && req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				cancelAttempt()
+				return nil, nil, fmt.Errorf("httpx: failed to recreate request body for retry: %w", err)
+			}
+			attemptReq.Body = body
 		}
 		if c.requestHook != nil {
 			c.requestHook(ctx, attemptReq)
@@ -465,25 +478,42 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 		}
 
 		if attempt >= maxAttempts {
-			return resp, err
+			if err != nil {
+				cancelAttempt()
+				return nil, nil, err
+			}
+			return resp, cancel, nil
 		}
 		var delay time.Duration
 		if err != nil {
+			cancelAttempt()
 			if ctx.Err() != nil || !policy.RetryNetworkErrors || !retryableNetErr(err) {
-				return nil, err
+				return nil, nil, err
+			}
+			// Keep the last failure for the ctx-deadline message, with the URL redacted
+			// (a *url.Error carries the raw URL, including the query string).
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				cp := *ue
+				cp.URL = redactURL(req.URL)
+				lastErr = &cp
+			} else {
+				lastErr = err
 			}
 			delay, _ = retryDelay(policy, attempt, nil, time.Now())
 		} else {
 			if !containsInt(policy.RetryableStatusCodes, resp.StatusCode) {
-				return resp, nil
+				return resp, cancel, nil
 			}
 			var giveUp bool
 			delay, giveUp = retryDelay(policy, attempt, resp, time.Now())
 			if giveUp {
-				return resp, nil // server wants a longer pause than we allow: hand the response back
+				return resp, cancel, nil
 			}
+			lastErr = fmt.Errorf("last attempt returned status %d", resp.StatusCode)
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainLimit))
 			_ = resp.Body.Close()
+			cancelAttempt()
 		}
 
 		if delay > 0 {
@@ -491,11 +521,17 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return nil, ctx.Err()
+				if lastErr != nil {
+					return nil, nil, fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+				}
+				return nil, nil, ctx.Err()
 			case <-timer.C:
 			}
 		} else if ctx.Err() != nil {
-			return nil, ctx.Err()
+			if lastErr != nil {
+				return nil, nil, fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+			}
+			return nil, nil, ctx.Err()
 		}
 	}
 }
@@ -526,7 +562,7 @@ func redactURL(u *url.URL) string {
 	return r.String()
 }
 
-// state is a snapshot of the builder taken under its lock, so Send never holds the lock
+// state is a snapshot of the builder taken under its lock, so Do never holds the lock
 // during network I/O or backoff sleeps.
 type state struct {
 	method      string
@@ -577,8 +613,15 @@ func cloneValues(v url.Values) url.Values {
 
 func (c *Client) buildURL(s state) (string, error) {
 	raw := s.url
-	for name, value := range s.pathParams {
-		raw = strings.ReplaceAll(raw, "{"+name+"}", url.PathEscape(value))
+	if len(s.pathParams) > 0 {
+		pairs := make([]string, 0, len(s.pathParams)*2)
+		for name, value := range s.pathParams {
+			if value == "." || value == ".." {
+				return "", fmt.Errorf("httpx: invalid path parameter value %q", value)
+			}
+			pairs = append(pairs, "{"+name+"}", url.PathEscape(value))
+		}
+		raw = strings.NewReplacer(pairs...).Replace(raw)
 	}
 	ref, err := url.Parse(raw)
 	if err != nil {
@@ -591,7 +634,7 @@ func (c *Client) buildURL(s state) (string, error) {
 	case c.baseURL != nil:
 		joined := *c.baseURL
 		joined.Path = strings.TrimRight(c.baseURL.Path, "/") + "/" + strings.TrimLeft(ref.Path, "/")
-		joined.RawPath = ""
+		joined.RawPath = strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/" + strings.TrimLeft(ref.EscapedPath(), "/")
 		joined.RawQuery = ref.RawQuery
 		joined.Fragment = ref.Fragment
 		u = &joined
