@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Version = "v1.0.2"
+const Version = "v1.0.3"
 
 const (
 	defaultTimeout     = 30 * time.Second
@@ -88,6 +88,7 @@ type Response struct {
 	maxBodyBytes int64
 	method       string
 	safeURL      string
+	errTarget    any
 }
 
 // TraceInfo holds timings collected through net/http/httptrace. They're
@@ -192,6 +193,9 @@ type HTTPError struct {
 	Status     string
 	Header     http.Header
 	Body       string
+	// Decoded is true when the body was decoded into the value given to ErrorInto.
+	// Only JSON responses are decoded (see ErrorInto).
+	Decoded bool
 }
 
 func (e *HTTPError) Error() string {

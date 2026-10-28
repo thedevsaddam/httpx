@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -53,6 +55,22 @@ func (r *Response) IsSuccess() bool {
 	return r != nil && r.Response != nil && r.StatusCode >= 200 && r.StatusCode < 300
 }
 
+// isJSONContentType reports whether the Content-Type is application/json or
+// a +json type such as application/problem+json. A missing header counts as
+// JSON, since plenty of APIs leave it out; text/html, text/plain and the like
+// do not.
+func isJSONContentType(h http.Header) bool {
+	v := h.Get("Content-Type")
+	if strings.TrimSpace(v) == "" {
+		return true
+	}
+	mt, _, err := mime.ParseMediaType(v)
+	if err != nil {
+		return false
+	}
+	return mt == "application/json" || strings.HasSuffix(mt, "+json")
+}
+
 // readAll reads and closes the body of a 2xx response within the size limit.
 // Any other status comes back as *HTTPError.
 func readAll(resp *Response, err error) ([]byte, error) {
@@ -65,18 +83,32 @@ func readAll(resp *Response, err error) ([]byte, error) {
 	defer resp.Close()
 
 	if !resp.IsSuccess() {
-		excerpt, readErr := io.ReadAll(io.LimitReader(resp.Body, errorBodyExcerpt+1))
-		body := string(excerpt)
-		if len(excerpt) > errorBodyExcerpt {
-			body = string(excerpt[:errorBodyExcerpt]) + "…[truncated]"
+		// only JSON bodies are decoded, so anything else stays a short excerpt
+		decode := resp.errTarget != nil && isJSONContentType(resp.Header)
+		readLimit := int64(errorBodyExcerpt + 1)
+		if decode {
+			readLimit = resp.maxBodyBytes
+			if readLimit <= 0 {
+				readLimit = defaultMaxResponse
+			}
+			readLimit++
 		}
+		excerpt, readErr := io.ReadAll(io.LimitReader(resp.Body, readLimit))
 		if readErr != nil && len(excerpt) == 0 {
 			return nil, readErr
 		}
-		return nil, &HTTPError{
+		httpErr := &HTTPError{
 			Method: resp.method, URL: resp.safeURL, StatusCode: resp.StatusCode,
-			Status: resp.Status, Header: resp.Header.Clone(), Body: body,
+			Status: resp.Status, Header: resp.Header.Clone(), Body: string(excerpt),
 		}
+		if decode && readErr == nil && int64(len(excerpt)) < readLimit &&
+			len(bytes.TrimSpace(excerpt)) > 0 && json.Unmarshal(excerpt, resp.errTarget) == nil {
+			httpErr.Decoded = true
+		}
+		if len(excerpt) > errorBodyExcerpt {
+			httpErr.Body = string(excerpt[:errorBodyExcerpt]) + "…[truncated]"
+		}
+		return nil, httpErr
 	}
 
 	limit := resp.maxBodyBytes

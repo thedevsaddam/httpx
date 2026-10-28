@@ -567,3 +567,105 @@ func TestRetryStopsWhenRetryAfterExceedsMaxBackoff(t *testing.T) {
 		t.Fatalf("expected giveUp=true when Retry-After exceeds MaxBackoff, got delay=%s", delay)
 	}
 }
+
+// ErrroInto tests
+type apiErr struct{ Code, Message string }
+
+func errServer(status int, contentType, body string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header()["Content-Type"] = nil // no sniffed type unless we set one
+		if contentType != "" {
+			w.Header().Set("Content-Type", contentType)
+		}
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}))
+}
+
+func TestErrorInto(t *testing.T) {
+	const ok = `{"code":"x","message":"m"}`
+	msg := strings.Repeat("a", 9000)
+	huge := `{"code":"big","message":"` + msg + `"}`
+	want := apiErr{Code: "x", Message: "m"}
+	cases := []struct {
+		name, ct, body string
+		noErrorInto    bool
+		decoded        bool
+		want           apiErr // what the target holds afterwards
+	}{
+		{"json", "application/json", ok, false, true, want},
+		{"json charset, any case", "Application/JSON; charset=utf-8", ok, false, true, want},
+		{"+json type", "application/problem+json", ok, false, true, want},
+		{"missing content type", "", ok, false, true, want},
+		{"body over 4 KiB decoded in full", "application/json", huge, false, true, apiErr{"big", msg}},
+		{"text/html is skipped", "text/html", ok, false, false, apiErr{}},
+		{"garbage content type is skipped", "///;;", ok, false, false, apiErr{}},
+		{"invalid json", "application/json", `{"code":`, false, false, apiErr{}},
+		{"empty body", "application/json", "", false, false, apiErr{}},
+		{"no ErrorInto, nothing decoded", "application/json", ok, true, false, apiErr{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := errServer(422, tc.ct, tc.body)
+			defer srv.Close()
+			var e apiErr
+			rb := New().GET(srv.URL)
+			if !tc.noErrorInto {
+				rb = rb.ErrorInto(&e)
+			}
+			_, err := ToBytes(rb.Do(context.Background()))
+
+			var he *HTTPError
+			if !errors.As(err, &he) || he.StatusCode != 422 {
+				t.Fatalf("want *HTTPError 422, got %v", err)
+			}
+			if he.Decoded != tc.decoded || e != tc.want {
+				t.Fatalf("Decoded=%v target=%.80q, want %v %.80q", he.Decoded, e, tc.decoded, tc.want)
+			}
+			body := tc.body // Body is always the raw text, cut to 4 KiB
+			if len(body) > errorBodyExcerpt {
+				body = body[:errorBodyExcerpt] + "…[truncated]"
+			}
+			if he.Body != body {
+				t.Fatalf("Body = %.60q, want %.60q", he.Body, body)
+			}
+		})
+	}
+}
+
+func TestErrorIntoSuccessLeavesTargetAlone(t *testing.T) {
+	srv := errServer(200, "application/json", `{"code":"from-success"}`)
+	defer srv.Close()
+	e := apiErr{Code: "keep"}
+	if _, err := ToString(New().GET(srv.URL).ErrorInto(&e).Do(context.Background())); err != nil || e.Code != "keep" {
+		t.Fatalf("err=%v target=%+v", err, e)
+	}
+}
+
+// A body cut off at the size limit must not be decoded. A truncated JSON number
+// is still valid JSON (100 digits fit a float64), which an object would not be.
+func TestErrorIntoSkipsTruncatedBody(t *testing.T) {
+	srv := errServer(500, "application/json", strings.Repeat("1", 5000))
+	defer srv.Close()
+	var v any
+	_, err := ToBytes(New(WithMaxResponseBytes(100)).GET(srv.URL).ErrorInto(&v).Do(context.Background()))
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Decoded || v != nil {
+		t.Fatalf("err=%v Decoded=%v v=%v", err, he != nil && he.Decoded, v)
+	}
+}
+
+func TestErrorIntoTarget(t *testing.T) {
+	srv := errServer(200, "application/json", `{}`)
+	defer srv.Close()
+	for _, bad := range []any{apiErr{}, (*apiErr)(nil), "x"} {
+		if _, err := New().GET(srv.URL).ErrorInto(bad).Do(context.Background()); err == nil || !strings.Contains(err.Error(), "ErrorInto") {
+			t.Fatalf("%T: want an ErrorInto error, got %v", bad, err)
+		}
+	}
+	resp, err := New().GET(srv.URL).ErrorInto(nil).Do(context.Background()) // nil turns it off
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Close()
+}

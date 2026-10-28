@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,7 @@ type RequestBuilder struct {
 	formFields  url.Values
 	debug       bool
 	retryable   bool
+	errTarget   any
 }
 
 // setKind records the body mode and keeps the first conflict, if any.
@@ -282,6 +284,26 @@ func (rb *RequestBuilder) IdempotencyKey(key string) *RequestBuilder {
 	return rb
 }
 
+// ErrorInto sets where the JSON body of a non-2xx response is decoded, so
+// ToJSON, ToBytes and ToString fill it in and still return an *HTTPError:
+//
+//	var apiErr APIError
+//	todo, err := httpx.ToJSON[Todo](client.GET(u).ErrorInto(&apiErr).Do(ctx))
+//
+// Only responses with a JSON Content-Type (application/json or a +json type)
+// are decoded; a missing Content-Type counts as JSON. HTML, plain text and
+// other types are left alone and stay available in HTTPError.Body.
+//
+// v has to be a non-nil pointer. With it set, the whole error body is read
+// (up to the client's max response size) for decoding; HTTPError.Body still
+// holds only a short excerpt, and HTTPError.Decoded says whether decoding worked.
+func (rb *RequestBuilder) ErrorInto(v any) *RequestBuilder {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	rb.errTarget = v
+	return rb
+}
+
 // Timeout overrides the client timeout for this request. It's per attempt;
 // the context passed to Do still limits the whole call.
 func (rb *RequestBuilder) Timeout(timeout time.Duration) *RequestBuilder {
@@ -328,6 +350,11 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	}
 	if s.bodyErr != nil {
 		return nil, fmt.Errorf("httpx: failed to encode JSON body: %w", s.bodyErr)
+	}
+	if s.errTarget != nil {
+		if rv := reflect.ValueOf(s.errTarget); rv.Kind() != reflect.Pointer || rv.IsNil() {
+			return nil, errors.New("httpx: ErrorInto needs a non-nil pointer")
+		}
 	}
 	fullURL, err := c.buildURL(s)
 	if err != nil {
@@ -415,7 +442,7 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	if s.debug {
 		rb.writeDebug(ctx, trace)
 	}
-	return &Response{Response: resp, trace: trace, maxBodyBytes: c.maxResponseBytes, method: req.Method, safeURL: safeURL}, nil
+	return &Response{Response: resp, trace: trace, maxBodyBytes: c.maxResponseBytes, method: req.Method, safeURL: safeURL, errTarget: s.errTarget}, nil
 }
 
 // doWithRetry is the attempt loop, each attempt with its own timeout. On error
@@ -589,6 +616,7 @@ type state struct {
 	formFields  url.Values
 	debug       bool
 	retryable   bool
+	errTarget   any
 }
 
 func (rb *RequestBuilder) snapshot() state {
@@ -606,7 +634,7 @@ func (rb *RequestBuilder) snapshot() state {
 		files:       append([]filePart(nil), rb.files...),
 		fileReaders: append([]fileReaderPart(nil), rb.fileReaders...),
 		formFields:  cloneValues(rb.formFields),
-		debug:       rb.debug, retryable: rb.retryable,
+		debug:       rb.debug, retryable: rb.retryable, errTarget: rb.errTarget,
 	}
 }
 

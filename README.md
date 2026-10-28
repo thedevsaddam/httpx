@@ -10,6 +10,7 @@ A small, fluent Go HTTP client built on `net/http` with typed JSON decoding, ret
 - Fluent builders for `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `OPTIONS`, and `QUERY`
 - Typed JSON decoding with `ToJSON[T]`
 - Non-2xx handling via `HTTPError`
+- Typed JSON error bodies with `ErrorInto`
 - Configurable timeouts and connection pooling
 - Optional retries with bounded backoff
 - Request and response hooks for instrumentation
@@ -219,7 +220,7 @@ defer resp.Close()
 When `ToJSON[T]` receives a non-2xx response, it returns an `*httpx.HTTPError`. Use `errors.As` to inspect it:
 
 ```go
-user, err := httpx.ToJSON[User](client.GET("/users/123").Do(ctx))
+user, err := httpx.ToJSON[User](client.GET("/users/{id}").PathParam("id", "1").Do(ctx))
 if err != nil {
 	var httpErr *httpx.HTTPError
 	if errors.As(err, &httpErr) {
@@ -231,6 +232,52 @@ _ = user
 ```
 
 `HTTPError.Body` is a bounded excerpt, not necessarily the full response. Avoid logging it if it could contain secrets or personal information.
+
+### Decoding structured error bodies
+
+Many APIs describe failures in a JSON body, such as `{"code": "...", "message": "..."}`. Pass a pointer to your own struct with `ErrorInto` and `httpx` fills it in when the response is not 2xx:
+
+```go
+type APIError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+var apiErr APIError
+user, err := httpx.ToJSON[User](
+	client.GET("/users/123").ErrorInto(&apiErr).Do(ctx),
+)
+if err != nil {
+	var httpErr *httpx.HTTPError
+	if errors.As(err, &httpErr) {
+		if httpErr.Decoded {
+			return fmt.Errorf("api error %s: %s (HTTP %d)", apiErr.Code, apiErr.Message, httpErr.StatusCode)
+		}
+		// Not JSON (an HTML page from a proxy, plain text, ...): use the raw excerpt.
+		return fmt.Errorf("HTTP %d: %s", httpErr.StatusCode, httpErr.Body)
+	}
+	return err // network error, timeout, and so on
+}
+_ = user
+```
+
+How it behaves:
+
+- The error is still an `*httpx.HTTPError`, so existing `errors.As` checks keep working. `ErrorInto` only adds the decoded struct and the `Decoded` flag.
+- Check `httpErr.Decoded` before reading your struct. It is `true` only when the body was decoded without error.
+- Only JSON responses are decoded: `Content-Type` of `application/json` or any `+json` type (such as `application/problem+json`). A missing `Content-Type` counts as JSON. HTML, plain text and other types are skipped and left in `HTTPError.Body`.
+- The whole error body is read for decoding, up to `WithMaxResponseBytes` (10 MiB by default). A body larger than that is not decoded. `HTTPError.Body` stays a short excerpt either way.
+- A 2xx response never touches your struct, and requests without `ErrorInto` behave as before.
+- It works with `ToJSON`, `ToBytes` and `ToString`. Pass a non-nil pointer; anything else makes `Do` return an error.
+
+```go
+var apiErr APIError
+
+// Any of these fills apiErr on a non-2xx response:
+user, err := httpx.ToJSON[User](client.GET(u).ErrorInto(&apiErr).Do(ctx))
+raw,  err := httpx.ToBytes(client.GET(u).ErrorInto(&apiErr).Do(ctx))
+text, err := httpx.ToString(client.GET(u).ErrorInto(&apiErr).Do(ctx))
+```
 
 ## Client configuration
 
