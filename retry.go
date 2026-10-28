@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"math"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -11,11 +12,13 @@ import (
 	"time"
 )
 
-// RetryPolicy controls retries. MaxAttempts includes the first attempt. A value below 2
-// means no retries. Jitter enables full jitter: each backoff is randomized between zero
-// and the exponential backoff cap. When RespectRetryAfter is set and the server asks for
-// a delay longer than MaxBackoff (when positive), the request is not retried and the
-// response is returned to the caller instead of hammering the server too early.
+const maxDuration = time.Duration(math.MaxInt64)
+
+// RetryPolicy controls retries. MaxAttempts counts the first try, so anything
+// below 2 means no retries. With Jitter each backoff is a random value between
+// zero and the exponential cap. With RespectRetryAfter, a server asking for
+// more than MaxBackoff (when set) is not waited for: the response is handed
+// back to the caller instead.
 type RetryPolicy struct {
 	MaxAttempts          int
 	InitialBackoff       time.Duration
@@ -26,9 +29,8 @@ type RetryPolicy struct {
 	RespectRetryAfter    bool
 }
 
-// StandardRetryPolicy returns a conservative policy for common transient failures.
-// It makes up to three total attempts, retries network errors and HTTP 429/502/503/504,
-// uses capped exponential backoff with full jitter, and honors Retry-After when present.
+// StandardRetryPolicy is a sane default: three attempts, network errors plus
+// 429/502/503/504, jittered backoff capped at 2s, and Retry-After honored.
 func StandardRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          3,
@@ -41,14 +43,12 @@ func StandardRetryPolicy() RetryPolicy {
 	}
 }
 
-// NoRetryPolicy disables retries.
+// NoRetryPolicy turns retries off.
 func NoRetryPolicy() RetryPolicy {
-	return RetryPolicy{
-		MaxAttempts: 1,
-	}
+	return RetryPolicy{MaxAttempts: 1}
 }
 
-// FastRetryPolicy is suitable for fast internal API calls.
+// FastRetryPolicy is meant for quick internal calls.
 func FastRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          2,
@@ -57,11 +57,10 @@ func FastRetryPolicy() RetryPolicy {
 		RetryableStatusCodes: []int{http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
 		RetryNetworkErrors:   true,
 		Jitter:               true,
-		RespectRetryAfter:    false,
 	}
 }
 
-// AggressiveRetryPolicy retries transient failures more often.
+// AggressiveRetryPolicy retries more often, and on 500s too.
 func AggressiveRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          5,
@@ -74,7 +73,7 @@ func AggressiveRetryPolicy() RetryPolicy {
 	}
 }
 
-// BackgroundRetryPolicy is suitable for non-interactive jobs.
+// BackgroundRetryPolicy is for batch jobs where nobody is waiting on the result.
 func BackgroundRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          8,
@@ -87,77 +86,84 @@ func BackgroundRetryPolicy() RetryPolicy {
 	}
 }
 
-// RateLimitRetryPolicy prioritizes handling HTTP 429 responses.
+// RateLimitRetryPolicy is tuned for 429s.
 func RateLimitRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          4,
 		InitialBackoff:       time.Second,
 		MaxBackoff:           30 * time.Second,
 		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusServiceUnavailable},
-		RetryNetworkErrors:   false,
 		Jitter:               true,
 		RespectRetryAfter:    true,
 	}
 }
 
-// ResilientRetryPolicy is intended for unreliable external APIs.
+// ResilientRetryPolicy is for flaky third-party APIs.
 func ResilientRetryPolicy() RetryPolicy {
 	return RetryPolicy{
 		MaxAttempts:          5,
 		InitialBackoff:       500 * time.Millisecond,
 		MaxBackoff:           10 * time.Second,
-		RetryableStatusCodes: []int{429, 500, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
+		RetryableStatusCodes: []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout},
 		RetryNetworkErrors:   true,
 		Jitter:               true,
 		RespectRetryAfter:    true,
 	}
 }
 
-// retryDelay returns how long to wait before the next attempt. giveUp is true when the
-// server's Retry-After exceeds what the policy is willing to wait.
-func retryDelay(policy RetryPolicy, retryNumber int, resp *http.Response, now time.Time) (delay time.Duration, giveUp bool) {
-	if policy.RespectRetryAfter && resp != nil {
-		if value := strings.TrimSpace(resp.Header.Get("Retry-After")); value != "" {
-			var serverDelay time.Duration
-			if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
-				if seconds > int64(time.Duration(1<<63-1)/time.Second) {
-					serverDelay = time.Duration(1<<63 - 1)
-				} else {
-					serverDelay = time.Duration(seconds) * time.Second
-				}
-			} else if when, err := http.ParseTime(value); err == nil && when.After(now) {
-				serverDelay = when.Sub(now)
+// retryDelay works out how long to wait before the next attempt. giveUp is set
+// when the server's Retry-After is longer than the policy allows.
+func retryDelay(p RetryPolicy, retryNumber int, resp *http.Response, now time.Time) (delay time.Duration, giveUp bool) {
+	if p.RespectRetryAfter && resp != nil {
+		if d := retryAfter(resp, now); d > 0 {
+			if p.MaxBackoff > 0 && d > p.MaxBackoff {
+				return 0, true
 			}
-			if serverDelay > 0 {
-				if policy.MaxBackoff > 0 && serverDelay > policy.MaxBackoff {
-					return 0, true
-				}
-				return serverDelay, false
-			}
+			return d, false
 		}
 	}
-	capDelay := policy.InitialBackoff
-	if capDelay <= 0 {
+
+	backoff := p.InitialBackoff
+	if backoff <= 0 {
 		return 0, false
 	}
 	for i := 1; i < retryNumber; i++ {
-		if capDelay > time.Duration(1<<63-1)/2 {
-			capDelay = time.Duration(1<<63 - 1)
+		if backoff > maxDuration/2 {
+			backoff = maxDuration
 			break
 		}
-		capDelay *= 2
+		backoff *= 2
 	}
-	if policy.MaxBackoff > 0 && capDelay > policy.MaxBackoff {
-		capDelay = policy.MaxBackoff
+	if p.MaxBackoff > 0 && backoff > p.MaxBackoff {
+		backoff = p.MaxBackoff
 	}
-	if policy.Jitter && capDelay > 0 {
-		return time.Duration(rand.Int63n(int64(capDelay))), false
+	if p.Jitter {
+		return time.Duration(rand.Int63n(int64(backoff))), false
 	}
-	return capDelay, false
+	return backoff, false
 }
 
-// retryableNetErr reports whether a transport error is worth retrying. Cancellation and
-// certificate problems are permanent, so they are never retried.
+// retryAfter parses the Retry-After header, either seconds or an HTTP date.
+// Zero means missing, invalid or already in the past.
+func retryAfter(resp *http.Response, now time.Time) time.Duration {
+	v := strings.TrimSpace(resp.Header.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil && secs >= 0 {
+		if secs > int64(maxDuration/time.Second) {
+			return maxDuration
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if when, err := http.ParseTime(v); err == nil && when.After(now) {
+		return when.Sub(now)
+	}
+	return 0
+}
+
+// retryableNetErr says whether a transport error is worth another try.
+// Cancellation and bad certificates won't fix themselves.
 func retryableNetErr(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) {
 		return false
@@ -167,8 +173,5 @@ func retryableNetErr(err error) bool {
 		certInvalid x509.CertificateInvalidError
 		hostErr     x509.HostnameError
 	)
-	if errors.As(err, &unknownAuth) || errors.As(err, &certInvalid) || errors.As(err, &hostErr) {
-		return false
-	}
-	return true
+	return !errors.As(err, &unknownAuth) && !errors.As(err, &certInvalid) && !errors.As(err, &hostErr)
 }

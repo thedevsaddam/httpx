@@ -37,7 +37,6 @@ type filePart struct {
 	path  string
 }
 
-// fileReaderPart is a multipart file part whose content comes from an io.Reader.
 type fileReaderPart struct {
 	field       string
 	filename    string
@@ -45,7 +44,8 @@ type fileReaderPart struct {
 	reader      io.Reader
 }
 
-// RequestBuilder builds an individual HTTP request.
+// RequestBuilder builds a single request. Don't share one between goroutines
+// that send it at the same time.
 type RequestBuilder struct {
 	mu          sync.Mutex
 	client      *Client
@@ -55,20 +55,20 @@ type RequestBuilder struct {
 	headers     http.Header
 	queryParams url.Values
 	kind        bodyKind
-	kindErr     error // first conflict between body modes
+	kindErr     error // first clash between body modes
 	body        io.Reader
 	bodyBytes   []byte
 	bodyErr     error
 	auth        Auth
 	timeout     time.Duration
-	files       []filePart // ordered; the same field may repeat
+	files       []filePart // in call order, a field may repeat
 	fileReaders []fileReaderPart
 	formFields  url.Values
 	debug       bool
 	retryable   bool
 }
 
-// setKind records the body mode and remembers the first conflicting use.
+// setKind records the body mode and keeps the first conflict, if any.
 func (rb *RequestBuilder) setKind(k bodyKind) {
 	if rb.kind != bodyNone && rb.kind != k && rb.kindErr == nil {
 		rb.kindErr = fmt.Errorf("httpx: conflicting request body modes: %s and %s", rb.kind, k)
@@ -81,18 +81,13 @@ func (c *Client) newRequest(method, rawURL string) *RequestBuilder {
 	if headers == nil {
 		headers = make(http.Header)
 	}
-	params := make(url.Values, len(c.queryParams))
-	for k, vv := range c.queryParams {
-		params[k] = append([]string(nil), vv...)
-	}
 	return &RequestBuilder{
 		client: c, method: method, url: rawURL, headers: headers,
-		queryParams: params, auth: c.auth, timeout: c.timeout,
+		queryParams: cloneValues(c.queryParams), auth: c.auth, timeout: c.timeout,
 		formFields: make(url.Values),
 	}
 }
 
-// Standard HTTP method constructors.
 func (c *Client) GET(url string) *RequestBuilder     { return c.newRequest(http.MethodGet, url) }
 func (c *Client) POST(url string) *RequestBuilder    { return c.newRequest(http.MethodPost, url) }
 func (c *Client) PUT(url string) *RequestBuilder     { return c.newRequest(http.MethodPut, url) }
@@ -101,12 +96,10 @@ func (c *Client) DELETE(url string) *RequestBuilder  { return c.newRequest(http.
 func (c *Client) HEAD(url string) *RequestBuilder    { return c.newRequest(http.MethodHead, url) }
 func (c *Client) OPTIONS(url string) *RequestBuilder { return c.newRequest(http.MethodOptions, url) }
 
-// QUERY initiates a safe, idempotent server-side query. The query definition is
-// typically sent in the request body, which should have an appropriate Content-Type.
-// Servers and intermediaries must support the QUERY method for this to work.
+// QUERY is the safe, idempotent QUERY method, normally with the query in the
+// body. The server and any proxies in between have to support it.
 func (c *Client) QUERY(url string) *RequestBuilder { return c.newRequest(methodQuery, url) }
 
-// Header sets a request header.
 func (rb *RequestBuilder) Header(key, value string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -114,7 +107,6 @@ func (rb *RequestBuilder) Header(key, value string) *RequestBuilder {
 	return rb
 }
 
-// Headers sets multiple request headers.
 func (rb *RequestBuilder) Headers(headers map[string]string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -124,7 +116,7 @@ func (rb *RequestBuilder) Headers(headers map[string]string) *RequestBuilder {
 	return rb
 }
 
-// PathParam replaces "{name}" in the URL with the escaped value, e.g. "/users/{id}".
+// PathParam fills in "{name}" in the URL with the escaped value, e.g. "/users/{id}".
 func (rb *RequestBuilder) PathParam(name, value string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -135,7 +127,7 @@ func (rb *RequestBuilder) PathParam(name, value string) *RequestBuilder {
 	return rb
 }
 
-// QueryParam appends a query parameter.
+// QueryParam adds a query parameter.
 func (rb *RequestBuilder) QueryParam(key, value string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -143,7 +135,7 @@ func (rb *RequestBuilder) QueryParam(key, value string) *RequestBuilder {
 	return rb
 }
 
-// QueryParams sets query parameters, replacing values for matching keys.
+// QueryParams sets query parameters, replacing existing values for the same keys.
 func (rb *RequestBuilder) QueryParams(params map[string]string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -153,8 +145,8 @@ func (rb *RequestBuilder) QueryParams(params map[string]string) *RequestBuilder 
 	return rb
 }
 
-// Body sets a raw request body. Retries need a replayable body: *bytes.Buffer,
-// *bytes.Reader and *strings.Reader qualify.
+// Body sets a raw body. For retries it has to be replayable, which
+// *bytes.Buffer, *bytes.Reader and *strings.Reader are.
 func (rb *RequestBuilder) Body(body io.Reader) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -163,8 +155,8 @@ func (rb *RequestBuilder) Body(body io.Reader) *RequestBuilder {
 	return rb
 }
 
-// JSON encodes v as JSON. Encoding errors are returned by Do rather than hidden in the body.
-// HTML characters (<, >, &) are not escaped.
+// JSON encodes v as the request body without escaping <, > and &.
+// An encoding error is returned from Do.
 func (rb *RequestBuilder) JSON(v any) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -182,16 +174,16 @@ func (rb *RequestBuilder) JSON(v any) *RequestBuilder {
 	return rb
 }
 
-// Form sets URL-encoded form data with one value per key.
+// Form sends URL-encoded form data, one value per key.
 func (rb *RequestBuilder) Form(fields map[string]string) *RequestBuilder {
 	values := make(url.Values, len(fields))
-	for key, value := range fields {
-		values.Set(key, value)
+	for k, v := range fields {
+		values.Set(k, v)
 	}
 	return rb.FormValues(values)
 }
 
-// FormValues sets URL-encoded form data. It supports multiple values for the same key.
+// FormValues is Form with several values allowed per key.
 func (rb *RequestBuilder) FormValues(values url.Values) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -202,8 +194,8 @@ func (rb *RequestBuilder) FormValues(values url.Values) *RequestBuilder {
 	return rb
 }
 
-// File attaches a local file as a multipart/form-data upload. It can be called several
-// times, including with the same field name; parts are sent in call order.
+// File attaches a local file to a multipart upload. Call it as often as you
+// like, even with the same field name; parts go out in call order.
 func (rb *RequestBuilder) File(fieldName, filePath string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -212,14 +204,12 @@ func (rb *RequestBuilder) File(fieldName, filePath string) *RequestBuilder {
 	return rb
 }
 
-// FileReader attaches content from r as a multipart/form-data file part named fieldName,
-// using filename as the uploaded file name. It can be called multiple times and combined
-// with File and Field.
+// FileReader attaches the content of r as a multipart file part. The content
+// type is optional and falls back to the filename's extension.
 //
-// The reader is consumed once, when Do builds the multipart body; the body is buffered
-// in memory so retries can replay it. The caller keeps ownership of r and must close it
-// if it is an io.Closer. Because r is consumed, a builder with FileReader cannot be
-// Sent a second time unless the reader is reset by the caller.
+// r is read once, when Do builds the body, and the result is buffered in
+// memory so retries can replay it. You still own r and should close it. Since
+// r is used up, sending the same builder twice needs a fresh reader.
 func (rb *RequestBuilder) FileReader(fieldName string, r io.Reader, filename string, contentType ...string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -251,20 +241,20 @@ func (rb *RequestBuilder) Field(key, value string) *RequestBuilder {
 	return rb
 }
 
-// Fields adds multiple multipart text field values.
+// Fields adds several multipart text fields.
 func (rb *RequestBuilder) Fields(fields url.Values) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
 	rb.setKind(bodyMultipart)
 	for key, values := range fields {
-		for _, value := range values {
-			rb.formFields.Add(key, value)
+		for _, v := range values {
+			rb.formFields.Add(key, v)
 		}
 	}
 	return rb
 }
 
-// Auth overrides client-level authentication for this request.
+// Auth overrides the client's auth for this request.
 func (rb *RequestBuilder) Auth(auth Auth) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -272,9 +262,9 @@ func (rb *RequestBuilder) Auth(auth Auth) *RequestBuilder {
 	return rb
 }
 
-// Retryable explicitly allows this request to be retried when the configured RetryPolicy
-// matches a retryable network error or status code. Use only when repeating the operation
-// is safe, typically with a server-supported idempotency key. Request bodies must be replayable.
+// Retryable lets a non-idempotent request (a POST, say) use the retry policy.
+// Only do that when repeating it is harmless, ideally with an idempotency key,
+// and the body can be replayed.
 func (rb *RequestBuilder) Retryable() *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -282,8 +272,8 @@ func (rb *RequestBuilder) Retryable() *RequestBuilder {
 	return rb
 }
 
-// IdempotencyKey sets the Idempotency-Key header and marks the request Retryable, which
-// makes retrying POST and PATCH safe against servers that honor the key.
+// IdempotencyKey sets the Idempotency-Key header and marks the request
+// retryable, so POST and PATCH can be retried against servers that honor it.
 func (rb *RequestBuilder) IdempotencyKey(key string) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -292,8 +282,8 @@ func (rb *RequestBuilder) IdempotencyKey(key string) *RequestBuilder {
 	return rb
 }
 
-// Timeout overrides the client-level timeout for this request.
-// It applies to each attempt separately; the caller's context still bounds the whole call.
+// Timeout overrides the client timeout for this request. It's per attempt;
+// the context passed to Do still limits the whole call.
 func (rb *RequestBuilder) Timeout(timeout time.Duration) *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -301,8 +291,8 @@ func (rb *RequestBuilder) Timeout(timeout time.Duration) *RequestBuilder {
 	return rb
 }
 
-// Debug enables trace output for this request. The report is logged after response headers
-// arrive (or when the request fails), to the logger or to stderr when none is configured.
+// Debug prints the trace once the headers arrive or the request fails, to the
+// logger if there is one and to stderr otherwise.
 func (rb *RequestBuilder) Debug() *RequestBuilder {
 	rb.mu.Lock()
 	defer rb.mu.Unlock()
@@ -318,10 +308,11 @@ func methodRetryable(method string, explicit bool) bool {
 	return explicit
 }
 
-// Do executes the request and returns the response. The caller must close the response body.
-// The request timeout applies to each attempt separately (a 10s timeout gives every retry its
-// own 10s), and for the final attempt it stays active until the body is closed. The caller's
-// ctx still bounds the whole call, including backoff waits.
+// Do sends the request. The caller has to close the response body.
+//
+// The timeout applies to each attempt on its own, so a 10s timeout gives every
+// retry a fresh 10s, and on the last attempt it keeps running until the body
+// is closed. ctx bounds the whole call, backoff waits included.
 func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -330,7 +321,7 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	if c.initErr != nil {
 		return nil, c.initErr
 	}
-	s := rb.snapshot() // lock is not held past this point
+	s := rb.snapshot()
 
 	if s.kindErr != nil {
 		return nil, s.kindErr
@@ -350,7 +341,7 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		s.headers.Set(headerContentType, multipartCT)
 	}
 
-	// ctx is the caller's context only; the per-attempt timeout is applied in doWithRetry.
+	// the per-attempt timeout is added later, in doWithRetry
 	req, err := http.NewRequestWithContext(ctx, s.method, fullURL, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("httpx: failed to create request: %w", err)
@@ -365,19 +356,20 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		c.tracer.Inject(ctx, req)
 	}
 
-	safeURL := redactURL(req.URL) // never log the raw URL: auth or callers may put secrets in the query
+	// the real URL can carry secrets in its query, so only log this one
+	safeURL := redactURL(req.URL)
 	start := time.Now()
 	trace := &TraceInfo{
 		Method: req.Method, URL: safeURL, Path: req.URL.EscapedPath(),
-		RequestAttempt: 1, startedAt: start,
+		RequestAttempt: 1,
 	}
 	req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace.hooks()))
 	if c.logger != nil {
 		c.logger.Debug(ctx, "HTTP request started", "method", req.Method, "url", safeURL)
 	}
 
-	// cancel belongs to the final attempt's timeout context (nil when no timeout is set).
-	// On error, doWithRetry has already cancelled it.
+	// cancel belongs to the last attempt's timeout context, nil without a timeout.
+	// On error doWithRetry has already called it.
 	resp, cancel, err := rb.doWithRetry(ctx, req, s, trace)
 
 	trace.mu.Lock()
@@ -391,7 +383,7 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	trace.mu.Unlock()
 
 	if err != nil {
-		// *url.Error embeds the raw URL (including the query string); swap in the redacted one.
+		// *url.Error carries the raw URL with its query string, swap it for the safe one
 		var ue *url.Error
 		if errors.As(err, &ue) {
 			ue.URL = safeURL
@@ -404,15 +396,15 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 		}
 		return nil, fmt.Errorf("httpx: request execution failed: %w", err)
 	}
-	// A 101 body is a writable stream (WebSocket etc.); wrapping it would hide io.Writer.
+
 	if cancel != nil {
 		switch {
 		case resp.Body == nil:
 			cancel()
 		case resp.StatusCode == http.StatusSwitchingProtocols:
-			// The caller owns the connection now. Don't cancel: that would tear down
-			// the upgraded connection. The timer is released when the deadline passes.
-			_ = cancel
+			// The caller owns the upgraded connection now, and it's writable
+			// (WebSocket etc.), so don't wrap the body or cancel. The timer
+			// cleans itself up at the deadline.
 		default:
 			resp.Body = &cancelOnCloseBody{ReadCloser: resp.Body, cancel: cancel}
 		}
@@ -426,10 +418,10 @@ func (rb *RequestBuilder) Do(ctx context.Context) (*Response, error) {
 	return &Response{Response: resp, trace: trace, maxBodyBytes: c.maxResponseBytes, method: req.Method, safeURL: safeURL}, nil
 }
 
-// doWithRetry runs the attempt loop. Every attempt gets its own s.timeout. On a non-nil error
-// the returned response and cancel are nil (any attempt context is already cancelled). On
-// success the returned cancel belongs to the returned response's attempt and must be called
-// when its body is closed.
+// doWithRetry is the attempt loop, each attempt with its own timeout. On error
+// the response and cancel func are nil and the attempt context is already
+// cancelled. On success the cancel func goes with the response and must be
+// called when its body is closed.
 func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s state, trace *TraceInfo) (*http.Response, context.CancelFunc, error) {
 	c := rb.client
 	policy := c.retryPolicy
@@ -437,7 +429,7 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 	if maxAttempts < 1 || !methodRetryable(req.Method, s.retryable) {
 		maxAttempts = 1
 	}
-	// A body is retryable only when net/http can recreate it for each attempt.
+	// can't retry a body that net/http isn't able to recreate
 	if req.Body != nil && req.Body != http.NoBody && req.GetBody == nil {
 		maxAttempts = 1
 	}
@@ -497,14 +489,14 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 			}
 			return resp, cancel, nil
 		}
+
 		var delay time.Duration
 		if err != nil {
 			cancelAttempt()
-			if ctx.Err() != nil || !policy.RetryNetworkErrors || !retryableNetErr(err) {
+			if !policy.RetryNetworkErrors || !retryableNetErr(err) {
 				return nil, nil, err
 			}
-			// Keep the last failure for the ctx-deadline message, with the URL redacted
-			// (a *url.Error carries the raw URL, including the query string).
+			// keep the failure for the ctx-deadline message, minus the query string
 			var ue *url.Error
 			if errors.As(err, &ue) {
 				cp := *ue
@@ -534,19 +526,21 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				if lastErr != nil {
-					return nil, nil, fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
-				}
-				return nil, nil, ctx.Err()
+				return nil, nil, ctxError(ctx, lastErr)
 			case <-timer.C:
 			}
 		} else if ctx.Err() != nil {
-			if lastErr != nil {
-				return nil, nil, fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
-			}
-			return nil, nil, ctx.Err()
+			return nil, nil, ctxError(ctx, lastErr)
 		}
 	}
+}
+
+// ctxError returns the context's error, with the last failed attempt attached when there was one.
+func ctxError(ctx context.Context, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+	}
+	return ctx.Err()
 }
 
 func containsInt(list []int, v int) bool {
@@ -566,7 +560,7 @@ func (rb *RequestBuilder) writeDebug(ctx context.Context, trace *TraceInfo) {
 	fmt.Fprintln(os.Stderr, trace.String())
 }
 
-// redactURL removes the query string and user info, which commonly carry secrets.
+// redactURL drops the query string and user info, both of which tend to hold secrets.
 func redactURL(u *url.URL) string {
 	if u == nil {
 		return ""
@@ -575,8 +569,8 @@ func redactURL(u *url.URL) string {
 	return r.String()
 }
 
-// state is a snapshot of the builder taken under its lock, so Do never holds the lock
-// during network I/O or backoff sleeps.
+// state is a copy of the builder taken under its lock, so Do never holds the
+// lock while it does network I/O or sleeps between retries.
 type state struct {
 	method      string
 	url         string
@@ -640,6 +634,7 @@ func (c *Client) buildURL(s state) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("httpx: invalid request URL: %w", err)
 	}
+
 	var u *url.URL
 	switch {
 	case ref.Scheme != "" && ref.Host != "":
@@ -649,19 +644,18 @@ func (c *Client) buildURL(s state) (string, error) {
 		joined.Path = strings.TrimRight(c.baseURL.Path, "/") + "/" + strings.TrimLeft(ref.Path, "/")
 		joined.RawPath = strings.TrimRight(c.baseURL.EscapedPath(), "/") + "/" + strings.TrimLeft(ref.EscapedPath(), "/")
 		q := joined.Query()
-
 		for key, values := range ref.Query() {
-			for _, value := range values {
-				q.Add(key, value)
+			for _, v := range values {
+				q.Add(key, v)
 			}
 		}
-
 		joined.RawQuery = q.Encode()
 		joined.Fragment = ref.Fragment
 		u = &joined
 	default:
 		return "", fmt.Errorf("httpx: URL must be absolute or have a valid BaseURL: %q", s.url)
 	}
+
 	q := u.Query()
 	for k, vv := range s.queryParams {
 		for _, v := range vv {

@@ -1,4 +1,5 @@
-// Package httpx provides a fluent HTTP client with retries, request tracing and response helpers.
+// Package httpx is a small fluent HTTP client on top of net/http, with
+// retries, request tracing and typed response helpers.
 package httpx
 
 import (
@@ -12,13 +13,13 @@ import (
 	"time"
 )
 
-const Version = "v1.0.1"
+const Version = "v1.0.2"
 
 const (
 	defaultTimeout     = 30 * time.Second
-	defaultMaxResponse = 10 << 20 // 10 MiB for ToJSON/ToBytes/ToString
-	errorBodyExcerpt   = 4 << 10  // bytes of an error response kept in HTTPError.Body
-	drainLimit         = 4 << 10  // bytes drained on Close to allow connection reuse
+	defaultMaxResponse = 10 << 20 // 10 MiB, applies to ToJSON/ToBytes/ToString
+	errorBodyExcerpt   = 4 << 10  // how much of an error body HTTPError keeps
+	drainLimit         = 4 << 10  // drained on Close so the connection can be reused
 	headerContentType  = "Content-Type"
 	contentTypeJSON    = "application/json"
 	contentTypeForm    = "application/x-www-form-urlencoded"
@@ -26,32 +27,30 @@ const (
 	methodQuery        = "QUERY"
 )
 
-// ErrEmptyBody is returned by ToJSON when a successful response has no body (for example 204).
+// ErrEmptyBody is returned by ToJSON for a successful response with no body (a 204, say).
 var ErrEmptyBody = errors.New("httpx: empty response body")
 
-// Logger is the optional structured logging interface.
+// Logger is an optional structured logger.
 type Logger interface {
 	Debug(ctx context.Context, msg string, keysAndValues ...any)
 	Info(ctx context.Context, msg string, keysAndValues ...any)
 	Error(ctx context.Context, msg string, keysAndValues ...any)
 }
 
-// Tracer injects distributed tracing information into an outgoing request.
+// Tracer injects trace context into outgoing requests.
 type Tracer interface {
 	Inject(ctx context.Context, req *http.Request)
 }
 
-// Auth injects authentication into an outgoing request.
+// Auth adds credentials to outgoing requests.
 type Auth interface {
 	Apply(req *http.Request) error
 }
 
-// Middleware wraps a RoundTripper, for example to add OpenTelemetry, metrics or rate limiting.
-// Middlewares run in the order given: the first one is the outermost.
+// Middleware wraps a RoundTripper. The first middleware given is the outermost.
 type Middleware func(http.RoundTripper) http.RoundTripper
 
-// Client wraps http.Client and provides defaults and fluent request builders.
-// A Client is safe for concurrent use once constructed.
+// Client is safe for concurrent use once built with New.
 type Client struct {
 	httpClient       *http.Client
 	baseURL          *url.URL
@@ -65,9 +64,10 @@ type Client struct {
 	retryPolicy      RetryPolicy
 	requestHook      RequestHook
 	responseHook     ResponseHook
-	initErr          error // configuration error reported by Send
+	initErr          error // bad config, surfaced by Do
 
-	// Collected by options and applied once at the end of New, so option order does not matter.
+	// Recorded by options and applied together at the end of New,
+	// which is why option order doesn't matter.
 	userClient    *http.Client
 	rawBaseURL    string
 	transport     http.RoundTripper
@@ -81,7 +81,7 @@ type Client struct {
 	timeoutSet    bool
 }
 
-// Response wraps http.Response and exposes trace information and helpers.
+// Response wraps http.Response.
 type Response struct {
 	*http.Response
 	trace        *TraceInfo
@@ -90,11 +90,10 @@ type Response struct {
 	safeURL      string
 }
 
-// TraceInfo contains timing and connection information collected with net/http/httptrace.
-// Durations are best-effort and some fields remain zero when a connection is reused,
-// a proxy is involved, or the transport does not emit the corresponding hook.
-// TotalTime measures the time until response headers are available.
-// URL never includes the query string, which may carry secrets.
+// TraceInfo holds timings collected through net/http/httptrace. They're
+// best-effort: some stay zero on a reused connection, behind a proxy, or when
+// the transport doesn't fire the hook. TotalTime stops when the response
+// headers arrive. URL never carries the query string since it may hold secrets.
 type TraceInfo struct {
 	Method         string
 	URL            string
@@ -119,11 +118,9 @@ type TraceInfo struct {
 	tlsStart       time.Time
 	requestWritten time.Time
 	firstByte      time.Time
-	gotConnAt      time.Time
-	startedAt      time.Time
 }
 
-// Snapshot returns a copy of the trace fields, safe to inspect while the request is running.
+// Snapshot returns a copy that is safe to read while the request is still running.
 func (t *TraceInfo) Snapshot() TraceInfo {
 	if t == nil {
 		return TraceInfo{}
@@ -140,7 +137,6 @@ func (t *TraceInfo) Snapshot() TraceInfo {
 	}
 }
 
-// String formats the trace in a human-readable diagnostic report.
 func (t *TraceInfo) String() string {
 	if t == nil {
 		return "Request Trace Info: <unavailable>"
@@ -171,15 +167,15 @@ func (t *TraceInfo) String() string {
 	)
 }
 
-// Trace returns a snapshot of the request timing information.
+// Trace returns a snapshot of the request timings.
 func (r *Response) Trace() TraceInfo {
-	if r == nil || r.trace == nil {
+	if r == nil {
 		return TraceInfo{}
 	}
 	return r.trace.Snapshot()
 }
 
-// Debug returns a formatted trace report for this response.
+// Debug returns the trace as a printable report.
 func (r *Response) Debug() string {
 	if r == nil {
 		return "Request Trace Info: <unavailable>"
@@ -187,8 +183,8 @@ func (r *Response) Debug() string {
 	return r.trace.String()
 }
 
-// HTTPError represents a non-2xx HTTP response. Body is a bounded excerpt (about 4 KiB).
-// URL never includes the query string.
+// HTTPError is what you get for a non-2xx response. Body is cut off at about 4 KiB
+// and URL has no query string.
 type HTTPError struct {
 	Method     string
 	URL        string
@@ -202,8 +198,8 @@ func (e *HTTPError) Error() string {
 	return fmt.Sprintf("httpx: %s %s: unexpected status code %d: %s", e.Method, e.URL, e.StatusCode, e.Body)
 }
 
-// RequestHook runs immediately before each network attempt. Hooks must be safe for concurrent calls.
+// RequestHook runs right before every attempt. It must be safe for concurrent use.
 type RequestHook func(context.Context, *http.Request)
 
-// ResponseHook runs after response headers arrive on each attempt. Hooks must be safe for concurrent calls.
+// ResponseHook runs after the headers of every attempt arrive. It must be safe for concurrent use.
 type ResponseHook func(context.Context, *http.Response)

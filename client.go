@@ -10,7 +10,8 @@ import (
 	"time"
 )
 
-// PoolConfig configures the standard HTTP transport connection pool.
+// PoolConfig tunes the connection pool of the default transport.
+// Zero values leave the transport's own setting alone.
 type PoolConfig struct {
 	MaxIdleConns          int
 	MaxIdleConnsPerHost   int
@@ -20,15 +21,16 @@ type PoolConfig struct {
 	ResponseHeaderTimeout time.Duration
 }
 
-// Option configures a Client. Options only record intent; the HTTP client is built once
-// at the end of New, so the order of options does not matter.
+// Option configures a Client. Options only record what was asked for and
+// New builds the http.Client once at the end, so their order doesn't matter.
 type Option func(*Client)
 
 func defaultTransport() *http.Transport {
 	return &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout: 30 * time.Second, KeepAlive: 30 * time.Second,
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
@@ -39,12 +41,12 @@ func defaultTransport() *http.Transport {
 	}
 }
 
-// New creates a client with connection pooling enabled by default.
+// New creates a client. Connection pooling is on by default.
 func New(options ...Option) *Client {
-	defaultHeaders := make(http.Header)
-	defaultHeaders.Set("User-Agent", "httpx/"+Version)
+	headers := make(http.Header)
+	headers.Set("User-Agent", "httpx/"+Version)
 	c := &Client{
-		headers:          defaultHeaders,
+		headers:          headers,
 		queryParams:      make(url.Values),
 		timeout:          defaultTimeout,
 		maxResponseBytes: defaultMaxResponse,
@@ -58,7 +60,7 @@ func New(options ...Option) *Client {
 	return c
 }
 
-// build assembles the final *http.Client from everything the options recorded.
+// build puts the final *http.Client together from the recorded options.
 func (c *Client) build() {
 	if c.rawBaseURL != "" {
 		u, err := url.Parse(c.rawBaseURL)
@@ -72,7 +74,7 @@ func (c *Client) build() {
 		}
 	}
 
-	// Never mutate a client the caller handed us.
+	// work on a copy, the caller's client stays untouched
 	var hc http.Client
 	if c.userClient != nil {
 		hc = *c.userClient
@@ -89,8 +91,7 @@ func (c *Client) build() {
 		rt = defaultTransport()
 	}
 
-	needsTransportTweaks := c.pool != nil || c.tlsConfig != nil || c.proxySet
-	if needsTransportTweaks {
+	if c.pool != nil || c.tlsConfig != nil || c.proxySet {
 		if t, ok := rt.(*http.Transport); ok && t != nil {
 			t = t.Clone()
 			if c.pool != nil {
@@ -104,7 +105,7 @@ func (c *Client) build() {
 			}
 			rt = t
 		} else if c.initErr == nil {
-			c.initErr = errors.New("httpx: WithPoolConfig/WithTLSConfig/WithProxy require an *http.Transport")
+			c.initErr = errors.New("httpx: WithPoolConfig, WithTLSConfig and WithProxy need an *http.Transport")
 		}
 	}
 
@@ -120,8 +121,8 @@ func (c *Client) build() {
 	if c.jar != nil {
 		hc.Jar = c.jar
 	}
-	// The deadline is enforced with a per-request context instead, so a per-request
-	// Timeout() can both shorten and extend it. http.Client.Timeout would silently win.
+	// Timeouts are handled with a per-request context so Timeout() on a request
+	// can lengthen them too. http.Client.Timeout would always win otherwise.
 	hc.Timeout = 0
 	c.httpClient = &hc
 }
@@ -147,23 +148,22 @@ func applyPool(t *http.Transport, cfg PoolConfig) {
 	}
 }
 
-// Close releases idle connections held by the client's transport.
+// Close drops idle connections held by the transport.
 func (c *Client) Close() { c.httpClient.CloseIdleConnections() }
 
-// WithPoolConfig configures connection pooling. Zero values retain the transport defaults.
-// It requires the underlying transport to be an *http.Transport.
+// WithPoolConfig sets up connection pooling. Needs an *http.Transport underneath.
 func WithPoolConfig(cfg PoolConfig) Option { return func(c *Client) { c.pool = &cfg } }
 
-// WithTLSConfig sets the TLS client configuration (custom CAs, client certificates for mTLS, ...).
-// It requires the underlying transport to be an *http.Transport.
+// WithTLSConfig sets the TLS config, e.g. custom CAs or client certs for mTLS.
+// Needs an *http.Transport underneath.
 func WithTLSConfig(cfg *tls.Config) Option { return func(c *Client) { c.tlsConfig = cfg } }
 
-// WithProxy sets the proxy function. Pass nil to disable proxies entirely.
+// WithProxy sets the proxy function. Pass nil to turn proxies off.
 func WithProxy(proxy func(*http.Request) (*url.URL, error)) Option {
 	return func(c *Client) { c.proxy, c.proxySet = proxy, true }
 }
 
-// WithMiddleware appends RoundTripper middlewares (tracing, metrics, rate limiting, ...).
+// WithMiddleware adds RoundTripper middlewares (metrics, rate limiting, ...).
 func WithMiddleware(m ...Middleware) Option {
 	return func(c *Client) { c.middlewares = append(c.middlewares, m...) }
 }
@@ -173,11 +173,10 @@ func WithCheckRedirect(fn func(req *http.Request, via []*http.Request) error) Op
 	return func(c *Client) { c.checkRedirect = fn }
 }
 
-// WithCookieJar sets the cookie jar.
 func WithCookieJar(jar http.CookieJar) Option { return func(c *Client) { c.jar = jar } }
 
-// WithMaxResponseBytes sets the maximum body size consumed by ToJSON, ToBytes and ToString.
-// Send still exposes a streaming body; callers can stream arbitrarily large responses themselves.
+// WithMaxResponseBytes caps what ToJSON, ToBytes and ToString will read.
+// A body you read yourself from Do is not limited.
 func WithMaxResponseBytes(n int64) Option {
 	return func(c *Client) {
 		if n > 0 {
@@ -186,7 +185,7 @@ func WithMaxResponseBytes(n int64) Option {
 	}
 }
 
-// WithRetryPolicy configures opt-in retries. Retries are limited to idempotent methods and replayable bodies.
+// WithRetryPolicy turns on retries. Only idempotent methods with replayable bodies are retried.
 func WithRetryPolicy(p RetryPolicy) Option {
 	return func(c *Client) {
 		p.RetryableStatusCodes = append([]int(nil), p.RetryableStatusCodes...)
@@ -197,12 +196,11 @@ func WithRetryPolicy(p RetryPolicy) Option {
 func WithRequestHook(h RequestHook) Option   { return func(c *Client) { c.requestHook = h } }
 func WithResponseHook(h ResponseHook) Option { return func(c *Client) { c.responseHook = h } }
 
-// WithClientName sets a Header `X-Client-Name`.
+// WithClientName sets the X-Client-Name header.
 func WithClientName(value string) Option {
 	return func(c *Client) { c.headers.Set("X-Client-Name", value) }
 }
 
-// WithTransport sets a custom transport.
 func WithTransport(transport http.RoundTripper) Option {
 	return func(c *Client) {
 		if transport != nil {
@@ -211,46 +209,33 @@ func WithTransport(transport http.RoundTripper) Option {
 	}
 }
 
-// WithHTTPClient uses a copy of a custom *http.Client; the original is never modified.
-// Its Timeout becomes the default request timeout unless WithTimeout is also given.
+// WithHTTPClient builds on a copy of client, the original isn't modified.
+// Its Timeout is the default request timeout unless WithTimeout is also set.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *Client) { c.userClient = client }
 }
 
-// WithTimeout sets the default timeout for requests. It covers the whole call, including
-// all retry attempts, backoff waits and (until Close) reading the response body.
-// Zero disables the timeout.
+// WithTimeout sets the default timeout for a request attempt. Zero disables it.
 func WithTimeout(timeout time.Duration) Option {
 	return func(c *Client) { c.timeout, c.timeoutSet = timeout, true }
 }
 
-// WithBaseURL sets a base URL prepended to relative request paths. Path segments of the
-// base are preserved: base "https://x.com/v1" and path "/users" give "https://x.com/v1/users".
+// WithBaseURL sets the base for relative paths. Its own path is kept, so
+// "https://x.com/v1" plus "/users" gives "https://x.com/v1/users".
 func WithBaseURL(baseURL string) Option {
 	return func(c *Client) { c.rawBaseURL = baseURL }
 }
 
-// WithHeader sets a default header.
 func WithHeader(key, value string) Option {
 	return func(c *Client) { c.headers.Set(key, value) }
 }
 
-// WithQueryParam sets a default query parameter.
 func WithQueryParam(key, value string) Option {
 	return func(c *Client) { c.queryParams.Add(key, value) }
 }
 
-// WithAuth sets default authentication.
-func WithAuth(auth Auth) Option {
-	return func(c *Client) { c.auth = auth }
-}
+func WithAuth(auth Auth) Option { return func(c *Client) { c.auth = auth } }
 
-// WithLogger sets structured logging.
-func WithLogger(logger Logger) Option {
-	return func(c *Client) { c.logger = logger }
-}
+func WithLogger(logger Logger) Option { return func(c *Client) { c.logger = logger } }
 
-// WithTracer sets distributed trace propagation.
-func WithTracer(tracer Tracer) Option {
-	return func(c *Client) { c.tracer = tracer }
-}
+func WithTracer(tracer Tracer) Option { return func(c *Client) { c.tracer = tracer } }

@@ -60,7 +60,6 @@ func (t *TraceInfo) hooks() *httptrace.ClientTrace {
 			if !t.connectStart.IsZero() && t.ConnTime == 0 {
 				t.ConnTime = time.Since(t.connectStart)
 			}
-			t.gotConnAt = time.Now()
 			t.mu.Unlock()
 		},
 		WroteRequest: func(httptrace.WroteRequestInfo) {

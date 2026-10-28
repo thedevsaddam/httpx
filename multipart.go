@@ -10,10 +10,10 @@ import (
 	"net/textproto"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
-// buildBody turns the recorded body mode into a replayable reader and, for multipart,
-// the Content-Type header value to use.
+// buildBody returns a reader for the body and, for multipart, the Content-Type to send.
 func buildBody(s state) (io.Reader, string, error) {
 	switch s.kind {
 	case bodyMultipart:
@@ -32,12 +32,12 @@ func buildMultipart(s state) (io.Reader, string, error) {
 	buf := &bytes.Buffer{}
 	mw := multipart.NewWriter(buf)
 
-	// Text fields first (some servers require metadata before the file), in sorted order.
+	// text fields go first, sorted, since some servers want metadata before the file
 	keys := make([]string, 0, len(s.formFields))
 	for k := range s.formFields {
 		keys = append(keys, k)
 	}
-	sortStrings(keys)
+	sort.Strings(keys)
 	for _, k := range keys {
 		for _, v := range s.formFields[k] {
 			if err := mw.WriteField(k, v); err != nil {
@@ -63,10 +63,10 @@ func buildMultipart(s state) (io.Reader, string, error) {
 
 	for _, fr := range s.fileReaders {
 		if fr.reader == nil {
-			return nil, "", fmt.Errorf("httpx: FileReader %q: reader must not be nil", fr.field)
+			return nil, "", fmt.Errorf("httpx: FileReader %q: reader is nil", fr.field)
 		}
 		if fr.filename == "" {
-			return nil, "", fmt.Errorf("httpx: FileReader %q: filename must not be empty", fr.field)
+			return nil, "", fmt.Errorf("httpx: FileReader %q: filename is empty", fr.field)
 		}
 		if err := addFilePart(mw, fr.field, fr.filename, fr.contentType, fr.reader); err != nil {
 			return nil, "", fmt.Errorf("httpx: failed to add file %q: %w", fr.filename, err)
@@ -74,7 +74,7 @@ func buildMultipart(s state) (io.Reader, string, error) {
 	}
 
 	if err := mw.Close(); err != nil {
-		return nil, "", fmt.Errorf("httpx: failed to finalize multipart body: %w", err)
+		return nil, "", fmt.Errorf("httpx: failed to finish multipart body: %w", err)
 	}
 	return buf, mw.FormDataContentType(), nil
 }
@@ -93,12 +93,4 @@ func addFilePart(mw *multipart.Writer, field, filename, contentType string, r io
 	}
 	_, err = io.Copy(part, r)
 	return err
-}
-
-func sortStrings(s []string) {
-	for i := 1; i < len(s); i++ {
-		for j := i; j > 0 && s[j] < s[j-1]; j-- {
-			s[j], s[j-1] = s[j-1], s[j]
-		}
-	}
 }
