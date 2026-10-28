@@ -441,3 +441,129 @@ func TestBuildURLMergesBaseAndRequestQueryParams(t *testing.T) {
 		}
 	}
 }
+
+func TestBearerAuthRejectsNilRequest(t *testing.T) {
+	if err := NewBearerAuth("token").Apply(nil); err == nil {
+		t.Fatal("expected nil request error")
+	}
+}
+
+func TestAPIKeyAuthRejectsNilRequest(t *testing.T) {
+	req := (*http.Request)(nil)
+	if err := NewAPIKeyAuth("X-API-Key", "abc").Apply(req); err == nil {
+		t.Fatal("expected nil request error")
+	}
+}
+
+func TestRequestBuilderRejectsConflictingBodyModes(t *testing.T) {
+	client := New()
+	req := client.POST("https://example.com")
+
+	req.JSON(map[string]string{"a": "b"})
+	req.Form(map[string]string{"x": "y"})
+
+	if _, err := req.Do(context.Background()); err == nil {
+		t.Fatal("expected conflicting body mode error")
+	}
+}
+
+func TestJSONEncodeErrorSurfacesFromDo(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	_, err := New().POST(srv.URL).JSON(make(chan int)).Do(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "failed to encode JSON body") {
+		t.Fatalf("expected JSON encoding error, got %v", err)
+	}
+}
+
+func TestBuildURLRejectsInvalidPathParam(t *testing.T) {
+	client := New()
+	_, err := client.buildURL(state{
+		url: "/users/{id}",
+		pathParams: map[string]string{
+			"id": ".",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected invalid path parameter error")
+	}
+}
+
+func TestFileReaderRejectsNilReaderAndEmptyFilename(t *testing.T) {
+	client := New()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	// nil reader
+	_, err := client.POST(srv.URL).FileReader("file", nil, "a.txt").Do(context.Background())
+	if err == nil {
+		t.Fatal("expected nil reader error")
+	}
+
+	// empty filename
+	_, err = client.POST(srv.URL).FileReader("file", strings.NewReader("abc"), "").Do(context.Background())
+	if err == nil {
+		t.Fatal("expected empty filename error")
+	}
+}
+
+func TestToJSONEmptyBodyAndMalformedJSON(t *testing.T) {
+	t.Run("empty response body", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		defer srv.Close()
+
+		resp, err := New().GET(srv.URL).Do(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Close()
+
+		_, err = ToJSON[map[string]any](resp, nil)
+		if !errors.Is(err, ErrEmptyBody) {
+			t.Fatalf("expected ErrEmptyBody, got %v", err)
+		}
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, "{bad json")
+		}))
+		defer srv.Close()
+
+		resp, err := New().GET(srv.URL).Do(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Close()
+
+		_, err = ToJSON[map[string]any](resp, nil)
+		if err == nil {
+			t.Fatal("expected malformed JSON error")
+		}
+	})
+}
+
+func TestRetryStopsWhenRetryAfterExceedsMaxBackoff(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     make(http.Header),
+	}
+	resp.Header.Set("Retry-After", "120")
+
+	delay, giveUp := retryDelay(RetryPolicy{
+		InitialBackoff:    100 * time.Millisecond,
+		MaxBackoff:        2 * time.Second,
+		RespectRetryAfter: true,
+	}, 1, resp, time.Now())
+
+	if !giveUp {
+		t.Fatalf("expected giveUp=true when Retry-After exceeds MaxBackoff, got delay=%s", delay)
+	}
+}
