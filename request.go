@@ -445,6 +445,10 @@ func (rb *RequestBuilder) doWithRetry(ctx context.Context, req *http.Request, s 
 	var lastErr error
 
 	for attempt := 1; ; attempt++ {
+		if ctx.Err() != nil {
+			return nil, nil, ctx.Err()
+		}
+
 		trace.mu.Lock()
 		trace.RequestAttempt = attempt
 		trace.mu.Unlock()

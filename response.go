@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"sync"
 )
 
@@ -28,11 +29,14 @@ func (b *cancelOnCloseBody) Close() error {
 // Close closes the body. It drains up to 4 KiB to improve keep-alive reuse without
 // allowing an unexpectedly large response to block Close indefinitely.
 func (r *Response) Close() error {
-	if r != nil && r.Response != nil && r.Body != nil {
-		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, drainLimit))
-		return r.Body.Close()
+	if r == nil || r.Response == nil || r.Body == nil {
+		return nil
 	}
-	return nil
+	// A 101 body is the live upgraded connection; draining it would block until the peer writes.
+	if r.StatusCode != http.StatusSwitchingProtocols {
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, drainLimit))
+	}
+	return r.Body.Close()
 }
 
 // CopyTo streams the response body to dst without buffering the entire response in memory.
