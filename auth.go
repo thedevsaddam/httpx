@@ -9,6 +9,9 @@ import (
 type BearerAuth struct{ Token string }
 
 func (b BearerAuth) Apply(req *http.Request) error {
+	if req == nil {
+		return errors.New("httpx: cannot apply bearer auth to a nil request")
+	}
 	req.Header.Set("Authorization", "Bearer "+b.Token)
 	return nil
 }
