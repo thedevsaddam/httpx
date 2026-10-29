@@ -10,10 +10,12 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptrace"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -320,6 +322,159 @@ func (rb *RequestBuilder) Debug() *RequestBuilder {
 	defer rb.mu.Unlock()
 	rb.debug = true
 	return rb
+}
+
+// buildRequest is a helper method that constructs and configures the *http.Request
+// from the RequestBuilder state without sending it.
+func (rb *RequestBuilder) buildRequest(ctx context.Context) (*http.Request, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	c := rb.client
+	if c.initErr != nil {
+		return nil, c.initErr
+	}
+	s := rb.snapshot()
+	if s.kindErr != nil {
+		return nil, s.kindErr
+	}
+	if s.bodyErr != nil {
+		return nil, fmt.Errorf("httpx: failed to encode JSON body: %w", s.bodyErr)
+	}
+	fullURL, err := c.buildURL(s)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader, multipartCT, err := buildBody(s)
+	if err != nil {
+		return nil, err
+	}
+	if multipartCT != "" {
+		s.headers.Set(headerContentType, multipartCT)
+	}
+	req, err := http.NewRequestWithContext(ctx, s.method, fullURL, bodyReader)
+	if err != nil {
+		return nil, fmt.Errorf("httpx: failed to create request: %w", err)
+	}
+	req.Header = s.headers
+	if s.auth != nil {
+		if err := s.auth.Apply(req); err != nil {
+			return nil, fmt.Errorf("httpx: failed to apply auth: %w", err)
+		}
+	}
+	if c.tracer != nil {
+		c.tracer.Inject(ctx, req)
+	}
+	return req, nil
+}
+
+// ToText returns a textual representation of the outgoing HTTP request
+// without sending it.
+func (rb *RequestBuilder) ToText(ctx context.Context) (string, error) {
+	req, err := rb.buildRequest(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	data, err := httputil.DumpRequestOut(req, true)
+	if err != nil {
+		return "", fmt.Errorf("httpx: failed to dump request: %w", err)
+	}
+
+	return string(data), nil
+}
+
+// ToCURL returns a cURL command representation of the outgoing HTTP request
+// without sending it.
+func (rb *RequestBuilder) ToCURL(ctx context.Context) (string, error) {
+	req, err := rb.buildRequest(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	b.WriteString("curl -X ")
+	b.WriteString(shellQuote(req.Method))
+	b.WriteString(" ")
+	b.WriteString(shellQuote(req.URL.String()))
+
+	// Preserve a custom Host value.
+	host := req.Host
+	if host == "" {
+		host = req.Header.Get("Host")
+	}
+	if host != "" && host != req.URL.Host {
+		b.WriteString(" \\\n  -H ")
+		b.WriteString(shellQuote("Host: " + host))
+	}
+
+	// Sort headers for deterministic output.
+	keys := make([]string, 0, len(req.Header))
+	for key := range req.Header {
+		if strings.EqualFold(key, "Host") {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	for _, key := range keys {
+		switch strings.ToLower(key) {
+		case "content-length", "transfer-encoding", "connection",
+			"accept-encoding":
+			// Let cURL manage transport-specific headers.
+			continue
+		}
+
+		for _, value := range req.Header.Values(key) {
+			b.WriteString(" \\\n  -H ")
+			b.WriteString(shellQuote(key + ": " + value))
+		}
+	}
+
+	// Include the request body without unnecessarily consuming
+	// a replayable body.
+	if req.Body != nil && req.Body != http.NoBody {
+		bodyReader := req.Body
+
+		if req.GetBody != nil {
+			bodyReader, err = req.GetBody()
+			if err != nil {
+				return "", fmt.Errorf(
+					"httpx: failed to read request body for cURL: %w",
+					err,
+				)
+			}
+		}
+
+		body, readErr := io.ReadAll(bodyReader)
+		closeErr := bodyReader.Close()
+
+		if readErr != nil {
+			return "", fmt.Errorf(
+				"httpx: failed to read request body for cURL: %w",
+				readErr,
+			)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf(
+				"httpx: failed to close request body for cURL: %w",
+				closeErr,
+			)
+		}
+
+		if len(body) > 0 {
+			b.WriteString(" \\\n  -d ")
+			b.WriteString(shellQuote(string(body)))
+		}
+	}
+
+	return b.String(), nil
+}
+
+// shellQuote escapes a string for safe inclusion in a POSIX shell command.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 func methodRetryable(method string, explicit bool) bool {

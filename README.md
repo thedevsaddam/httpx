@@ -278,6 +278,73 @@ user, err := httpx.ToJSON[User](client.GET(u).ErrorInto(&apiErr).Do(ctx))
 raw,  err := httpx.ToBytes(client.GET(u).ErrorInto(&apiErr).Do(ctx))
 text, err := httpx.ToString(client.GET(u).ErrorInto(&apiErr).Do(ctx))
 ```
+## Request Inspection
+
+`httpx` provides `ToText()` and `ToCURL()` to inspect outgoing HTTP requests without sending them. These methods are useful for debugging, troubleshooting API integrations, and reproducing requests.
+
+### `ToText()`
+
+`ToText()` returns a human-readable representation of the outgoing HTTP request, including its method, URL, headers, and body.
+
+```go
+req := httpx.New().
+    POST("https://api.example.com/users").
+    Header("Authorization", "Bearer your-token").
+    JSON(map[string]any{
+        "name": "John Doe",
+        "email": "john@example.com",
+    })
+
+text, err := req.ToText(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Println(text)
+```
+
+Example output:
+
+```http
+POST /users HTTP/1.1
+Host: api.example.com
+Authorization: Bearer your-token
+Content-Type: application/json
+
+{"email":"john@example.com","name":"John Doe"}
+```
+
+### `ToCURL()`
+
+`ToCURL()` returns an equivalent cURL command that you can copy into a terminal to reproduce the request.
+
+```go
+curl, err := req.ToCURL(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+fmt.Println(curl)
+```
+
+Example output:
+
+```bash
+curl -X 'POST' 'https://api.example.com/users' \
+  -H 'Authorization: Bearer your-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"john@example.com","name":"John Doe"}'
+```
+
+#### Notes
+
+- Both methods build the outgoing request without sending it.
+- `ToText()` is useful for inspecting request details in logs or during development.
+- `ToCURL()` is useful for reproducing requests in a terminal or sharing them for debugging.
+- Request inspection may involve reading the request body. Verify body replay behavior for your request type, especially when using streaming bodies or file uploads.
+- Treat the output as sensitive: it may contain authorization headers, cookies, API keys, or personal data. Avoid logging or sharing it in production without appropriate redaction.
+- For arbitrary binary bodies and multipart requests, verify that the generated cURL command preserves the original request data before relying on it for reproduction.
+
 
 ## Client configuration
 

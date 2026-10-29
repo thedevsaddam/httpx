@@ -669,3 +669,258 @@ func TestErrorIntoTarget(t *testing.T) {
 	}
 	resp.Close()
 }
+
+func TestToText(t *testing.T) {
+	srv := errServer(200, "application/json", `{}`)
+	defer srv.Close()
+
+	for _, bad := range []any{apiErr{}, (*apiErr)(nil), "x"} {
+		if _, err := New().GET(srv.URL).ErrorInto(bad).Do(context.Background()); err == nil || !strings.Contains(err.Error(), "ErrorInto") {
+			t.Fatalf("%T: want an ErrorInto error, got %v", bad, err)
+		}
+	}
+
+	body := struct {
+		Name string `json:"name"`
+	}{
+		Name: "test",
+	}
+
+	httpText, err := New().
+		POST(srv.URL).
+		JSON(body).
+		ToText(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedBody := `{"name":"test"}`
+	expected := fmt.Sprintf(
+		"POST / HTTP/1.1\nHost: %s\nUser-Agent: httpx/v1.0.3\nContent-Length: %d\nContent-Type: application/json\nAccept-Encoding: gzip\n\n%s",
+		strings.TrimPrefix(srv.URL, "http://"),
+		len(expectedBody),
+		expectedBody,
+	)
+
+	normalize := func(s string) string {
+		return strings.ReplaceAll(s, "\r\n", "\n")
+	}
+
+	if normalize(httpText) != expected {
+		t.Fatalf("unexpected HTTP text:\nwant: %q\ngot:  %q", expected, normalize(httpText))
+	}
+}
+
+func TestToCURL(t *testing.T) {
+	t.Run("GET request", func(t *testing.T) {
+		req, err := New().
+			GET("https://example.com/users").
+			ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("ToCURL() error = %v", err)
+		}
+
+		for _, want := range []string{
+			"curl -X 'GET'",
+			"'https://example.com/users'",
+		} {
+			if !strings.Contains(req, want) {
+				t.Errorf("ToCURL() missing %q:\n%s", want, req)
+			}
+		}
+	})
+
+	t.Run("POST with JSON body", func(t *testing.T) {
+		req, err := New().
+			POST("https://example.com/users").
+			JSON(map[string]string{"name": "test"}).
+			ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("ToCURL() error = %v", err)
+		}
+
+		for _, want := range []string{
+			"curl -X 'POST'",
+			"-H 'Content-Type: application/json'",
+			`-d '{"name":"test"}'`,
+		} {
+			if !strings.Contains(req, want) {
+				t.Errorf("ToCURL() missing %q:\n%s", want, req)
+			}
+		}
+	})
+
+	t.Run("custom headers", func(t *testing.T) {
+		req, err := New().
+			GET("https://example.com").
+			Header("X-Custom", "custom-value").
+			Header("X-Request-ID", "request-123").
+			ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("ToCURL() error = %v", err)
+		}
+
+		for _, want := range []string{
+			"-H 'X-Custom: custom-value'",
+			"-H 'X-Request-ID: request-123'",
+		} {
+			if !strings.Contains(
+				strings.ToLower(req),
+				strings.ToLower(want),
+			) {
+				t.Errorf("ToCURL() missing %q:\n%s", want, req)
+			}
+		}
+	})
+
+	t.Run("shell escaping", func(t *testing.T) {
+		req, err := New().
+			GET("https://example.com").
+			Header("X-Custom", "it's a test; $(whoami)").
+			ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("ToCURL() error = %v", err)
+		}
+
+		want := `-H 'X-Custom: it'\''s a test; $(whoami)'`
+		if !strings.Contains(req, want) {
+			t.Errorf("ToCURL() missing escaped header %q:\n%s", want, req)
+		}
+	})
+
+	t.Run("deterministic header ordering", func(t *testing.T) {
+		builder := New().
+			GET("https://example.com").
+			Header("X-Zebra", "z").
+			Header("X-Apple", "a").
+			Header("X-Mango", "m")
+
+		first, err := builder.ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("first ToCURL() error = %v", err)
+		}
+
+		second, err := builder.ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("second ToCURL() error = %v", err)
+		}
+
+		if first != second {
+			t.Errorf("ToCURL() is not deterministic:\nfirst:\n%s\nsecond:\n%s", first, second)
+		}
+
+		apple := strings.Index(first, "-H 'X-Apple: a'")
+		mango := strings.Index(first, "-H 'X-Mango: m'")
+		zebra := strings.Index(first, "-H 'X-Zebra: z'")
+
+		if apple < 0 || mango < 0 || zebra < 0 {
+			t.Fatalf("expected headers not found:\n%s", first)
+		}
+		if !(apple < mango && mango < zebra) {
+			t.Errorf("headers are not sorted:\n%s", first)
+		}
+	})
+
+	t.Run("transport headers are omitted", func(t *testing.T) {
+		req, err := New().
+			POST("https://example.com").
+			Header("Connection", "keep-alive").
+			Header("Accept-Encoding", "gzip").
+			ToCURL(context.Background())
+		if err != nil {
+			t.Fatalf("ToCURL() error = %v", err)
+		}
+
+		for _, unwanted := range []string{
+			"-H 'Connection:",
+			"-H 'Accept-Encoding:",
+			"-H 'Content-Length:",
+			"-H 'Transfer-Encoding:",
+		} {
+			if strings.Contains(req, unwanted) {
+				t.Errorf("ToCURL() unexpectedly contains %q:\n%s", unwanted, req)
+			}
+		}
+	})
+
+	t.Run("nil context", func(t *testing.T) {
+		req, err := New().GET("https://example.com").ToCURL(nil)
+		if err != nil {
+			t.Fatalf("ToCURL(nil) error = %v", err)
+		}
+		if !strings.Contains(req, "curl -X 'GET'") {
+			t.Errorf("unexpected output:\n%s", req)
+		}
+	})
+}
+
+func TestShellQuote(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "plain string",
+			input: "hello",
+			want:  "'hello'",
+		},
+		{
+			name:  "single quote",
+			input: "it's",
+			want:  `'it'\''s'`,
+		},
+		{
+			name:  "spaces",
+			input: "hello world",
+			want:  "'hello world'",
+		},
+		{
+			name:  "shell metacharacters",
+			input: "$(whoami); rm -rf /",
+			want:  "'$(whoami); rm -rf /'",
+		},
+		{
+			name:  "empty string",
+			input: "",
+			want:  "''",
+		},
+		{
+			name:  "multiple single quotes",
+			input: "it's John's",
+			want:  `'it'\''s John'\''s'`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellQuote(tt.input); got != tt.want {
+				t.Errorf("shellQuote(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestToCURLHeadersAndAuth(t *testing.T) {
+	srv := errServer(200, "application/json", `{}`)
+	defer srv.Close()
+
+	curl, err := New().
+		GET(srv.URL).
+		Auth(NewBearerAuth("test-token")).
+		Header("X-Custom", "custom-value").
+		ToCURL(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, want := range []string{
+		"-X 'GET'",
+		"-H 'Authorization: Bearer test-token'",
+		"-H 'X-Custom: custom-value'",
+	} {
+		if !strings.Contains(curl, want) {
+			t.Errorf("cURL command missing %q:\n%s", want, curl)
+		}
+	}
+}
