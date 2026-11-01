@@ -1,9 +1,74 @@
 # httpx 🚀
 
-A small, fluent Go HTTP client built on `net/http` with typed JSON decoding, retries, tracing, streaming, and configurable connection pooling.
+A small, fluent Go HTTP client built on net/http. Zero dependencies, typed JSON, safe retries.
 
-[![Go](https://img.shields.io/badge/Go-1.23%2B-00ADD8?logo=go)](https://go.dev/)
+<div align="center">
+
+[![Go](https://img.shields.io/badge/Go-1.22%2B-00ADD8?logo=go)](https://go.dev/)
+[![Go Reference](https://pkg.go.dev/badge/github.com/thedevsaddam/httpx.svg)](https://pkg.go.dev/github.com/thedevsaddam/httpx)
+[![Release](https://img.shields.io/github/v/release/thedevsaddam/httpx?include_prereleases)](https://github.com/thedevsaddam/httpx/releases)
 ![Dependencies](https://img.shields.io/badge/dependencies-standard%20library-brightgreen)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/thedevsaddam/httpx/ci.yml?branch=main&label=build)](https://github.com/thedevsaddam/httpx/actions)
+[![License](https://img.shields.io/github/license/thedevsaddam/httpx)](https://github.com/thedevsaddam/httpx/blob/main/LICENSE.md)
+
+</div>
+
+## Why httpx?
+
+`net/http` is excellent but verbose: every call repeats the same request building, status checks, body limits, and cleanup. Bigger client libraries remove that boilerplate but bring dependencies and opinions with them.
+
+httpx sits in between: a thin, fluent layer over `net/http` that you can read in an afternoon.
+
+- **Zero dependencies.** Standard library only, so no third-party dependencies to audit and no version conflicts.
+- **Typed JSON with generics.** `httpx.ToJSON[T](...)` decodes the response and closes the body for you.
+- **Safe-by-default retries.** Retries are off until you enable them, then limited to idempotent methods with replayable bodies. `POST` retries need an explicit `.Retryable()`.
+- **Bounded reads.** JSON and error-body helpers cap response size (10 MiB by default) and return typed `*HTTPError` values.
+- **Built-in diagnostics.** Per-request `httptrace` timings, structured logging, and tracing hooks.
+- **Still `net/http` underneath.** Bring your own `*http.Client` or `*http.Transport` whenever you need to.
+
+## Before and after
+
+**Plain `net/http`:**
+
+```go
+req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.example.com/v1/users/123", nil)
+if err != nil {
+    return nil, err
+}
+req.Header.Set("Accept", "application/json")
+req.Header.Set("Authorization", "Bearer "+token)
+
+resp, err := http.DefaultClient.Do(req)
+if err != nil {
+    return nil, err
+}
+defer resp.Body.Close()
+
+if resp.StatusCode < 200 || resp.StatusCode > 299 {
+    b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+    return nil, fmt.Errorf("unexpected status %d: %s", resp.StatusCode, b)
+}
+
+var user User
+if err := json.NewDecoder(io.LimitReader(resp.Body, 10<<20)).Decode(&user); err != nil {
+    return nil, err
+}
+return &user, nil
+```
+
+**With httpx:**
+
+```go
+client := httpx.New(
+    httpx.WithBaseURL("https://api.example.com/v1"),
+    httpx.WithAuth(httpx.NewBearerAuth(token)),
+    httpx.WithRetryPolicy(httpx.StandardRetryPolicy()),
+)
+
+user, err := httpx.ToJSON[User](client.GET("/users/123").Do(ctx))
+```
+
+Same behavior (status check, bounded read, body closed), plus retries with backoff, in two statements.
 
 ## Features
 
@@ -12,16 +77,17 @@ A small, fluent Go HTTP client built on `net/http` with typed JSON decoding, ret
 - Non-2xx handling via `HTTPError`
 - Typed JSON error bodies with `ErrorInto`
 - Configurable timeouts and connection pooling
-- Optional retries with bounded backoff
+- Optional retries with bounded backoff and idempotency-key support
 - Request and response hooks for instrumentation
 - Bearer, Basic, and API key authentication
 - Multipart uploads, form submissions, raw bodies, and query parameters
 - Request logging and `httptrace` diagnostics
+- Request inspection with `ToText()` and `ToCURL()`
 - Streaming response copies via `Response.CopyTo`
 
 ## Requirements
 
-- Go 1.23 or newer
+- Go 1.22 or newer
 
 ## Installation
 
@@ -184,11 +250,11 @@ if _, err := resp.CopyTo(file); err != nil {
 ```go
 resp, err := client.POST("/upload").
 	Field("user_id", "12345").
-	Fields(url.Values{"tag": {"tag-1", "tag-2"}}).
-	File("avatar", "./avatar.png").
-	FileReader("attachments", bytes.NewReader(report), "report.pdf").
-	FileReader("attachments", logFile, "app.log").
-	FileReader("attachments", pdfReader, "report.pdf", "application/pdf").
+	Fields(url.Values{"tag": {"tag-1", "tag-2"}}).                         // repeated values
+	File("avatar", "./avatar.png").                                        // from file path
+	FileReader("attachments", bytes.NewReader(report), "report.pdf").      // from memory
+	FileReader("attachments", logFile, "app.log").                         // from any reader
+	FileReader("attachments", pdfReader, "report.pdf", "application/pdf"). // with content type
 	Do(ctx)
 if err != nil {
 	return err
@@ -248,15 +314,15 @@ user, err := httpx.ToJSON[User](
 	client.GET("/users/123").ErrorInto(&apiErr).Do(ctx),
 )
 if err != nil {
-	var httpErr *httpx.HTTPError
-	if errors.As(err, &httpErr) {
+	if httpErr, ok := errors.AsType[*httpx.HTTPError](err); ok {
 		if httpErr.Decoded {
 			return fmt.Errorf("api error %s: %s (HTTP %d)", apiErr.Code, apiErr.Message, httpErr.StatusCode)
 		}
 		// Not JSON (an HTML page from a proxy, plain text, ...): use the raw excerpt.
 		return fmt.Errorf("HTTP %d: %s", httpErr.StatusCode, httpErr.Body)
 	}
-	return err // network error, timeout, and so on
+	// network error, timeout, context.Canceled, context.DeadlineExceeded, and so on
+	return err
 }
 _ = user
 ```
@@ -278,6 +344,7 @@ user, err := httpx.ToJSON[User](client.GET(u).ErrorInto(&apiErr).Do(ctx))
 raw,  err := httpx.ToBytes(client.GET(u).ErrorInto(&apiErr).Do(ctx))
 text, err := httpx.ToString(client.GET(u).ErrorInto(&apiErr).Do(ctx))
 ```
+
 ## Request Inspection
 
 `httpx` provides `ToText()` and `ToCURL()` to inspect outgoing HTTP requests without sending them. These methods are useful for debugging, troubleshooting API integrations, and reproducing requests.
@@ -337,14 +404,15 @@ curl -X 'POST' 'https://api.example.com/users' \
 ```
 
 #### Notes
-
 - Both methods build the outgoing request without sending it.
-- `ToText()` is useful for inspecting request details in logs or during development.
-- `ToCURL()` is useful for reproducing requests in a terminal or sharing them for debugging.
-- Request inspection may involve reading the request body. Verify body replay behavior for your request type, especially when using streaming bodies or file uploads.
-- Treat the output as sensitive: it may contain authorization headers, cookies, API keys, or personal data. Avoid logging or sharing it in production without appropriate redaction.
-- For arbitrary binary bodies and multipart requests, verify that the generated cURL command preserves the original request data before relying on it for reproduction.
+- `ToText()` is useful for inspecting requests during development.
+- `ToCURL()` is useful for reproducing requests in a terminal. Redact secrets before sharing.
+- Inspecting a request buffers its body in memory, so avoid it for large uploads or streaming bodies.
 
+> [!WARNING]
+> `ToText()`, `ToCURL()`, and `.Debug()` output is not redacted. It can include
+> `Authorization` headers, cookies, API keys, and personal data. Don't log or
+> share it in production.
 
 ## Client configuration
 
@@ -395,7 +463,7 @@ For `PoolConfig`, zero values keep the transport defaults. Pool settings apply w
 
 ## Retries
 
-`MaxAttempts` includes the initial request. For a standard policy, use `StandardRetryPolicy()`: three total attempts, retries for network errors and HTTP 429/502/503/504, with capped exponential backoff.
+`MaxAttempts` includes the initial request. `StandardRetryPolicy()` makes three total attempts, retries network errors and HTTP 429/502/503/504, and uses capped exponential backoff with full jitter. It also honors the `Retry-After` header, capped by `MaxBackoff`.
 
 ```go
 client := httpx.New(
@@ -485,7 +553,7 @@ func (t *MyTracer) Inject(ctx context.Context, req *http.Request) {
 }
 ```
 
-Call `.Debug()` on an individual request to log timing and connection diagnostics. Read the trace snapshot with `resp.Trace()` or the formatted report with `resp.Debug()`. Trace timings are best used for debugging and performance analysis.
+Call `.Debug()` on an individual request to log timing and connection diagnostics. Read the trace snapshot with `resp.Trace()` or the formatted report with `resp.Debug()`. Trace timings are best-effort, and `TotalTime` ends when response headers arrive, not when the body has been fully read.
 
 ## Concurrency and response lifecycle
 
@@ -513,17 +581,26 @@ go vet ./...
 | `client.GET(url)` / `POST` / `PUT` / `PATCH` / `DELETE` / `HEAD` / `OPTIONS` / `QUERY` | Creates a request builder. |
 | `builder.Header(key, value)` / `Headers(map)` | Sets request headers. |
 | `builder.QueryParam(key, value)` / `QueryParams(map)` | Adds query parameters. |
+| `builder.PathParam(key, value)` | Fills a `{key}` placeholder in the URL path. |
 | `builder.JSON(value)` | Encodes a JSON request body. |
+| `builder.Form(map)` / `FormValues(url.Values)` | Sends a URL-encoded form body. Use one, not both. |
 | `builder.Body(reader)` | Sets a raw request body. |
-| `builder.File(field, path)` / `Field(key, value)` | Adds multipart fields. |
+| `builder.Field(key, value)` / `Fields(url.Values)` | Adds multipart form fields. |
+| `builder.File(field, path)` | Adds a multipart file from a path. |
+| `builder.FileReader(field, reader, filename[, contentType])` | Adds a multipart file from any reader. |
 | `builder.Auth(auth)` / `Timeout(d)` | Overrides request authentication or timeout. |
+| `builder.Retryable()` | Opts a non-idempotent request (such as `POST`) into the retry policy. |
+| `builder.IdempotencyKey(key)` | Sets the `Idempotency-Key` header. |
+| `builder.ErrorInto(&v)` | Decodes a JSON error body into `v` on non-2xx responses. |
 | `builder.Debug()` | Enables request diagnostics. |
+| `builder.ToText(ctx)` / `ToCURL(ctx)` | Returns the request as text or a cURL command without sending it. |
 | `builder.Do(ctx)` | Executes the request. |
 | `resp.IsSuccess()` | Reports whether the status code is 2xx. |
 | `resp.CopyTo(writer)` | Streams the response body to a writer and closes it. |
 | `resp.Close()` | Closes the response body. |
 | `resp.Trace()` / `resp.Debug()` | Returns trace information or a formatted report. |
 | `ToJSON[T](resp, err)` | Decodes JSON and closes the response body. |
+| `ToBytes(resp, err)` / `ToString(resp, err)` | Reads the body as bytes or a string and closes it. |
 
 ## License
 
