@@ -696,8 +696,9 @@ func TestToText(t *testing.T) {
 
 	expectedBody := `{"name":"test"}`
 	expected := fmt.Sprintf(
-		"POST / HTTP/1.1\nHost: %s\nUser-Agent: httpx/v1.0.5\nContent-Length: %d\nContent-Type: application/json\nAccept-Encoding: gzip\n\n%s",
+		"POST / HTTP/1.1\nHost: %s\nUser-Agent: httpx/%s\nContent-Length: %d\nContent-Type: application/json\nAccept-Encoding: gzip\n\n%s",
 		strings.TrimPrefix(srv.URL, "http://"),
+		Version,
 		len(expectedBody),
 		expectedBody,
 	)
