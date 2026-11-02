@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const Version = "v1.0.3"
+const Version = "v1.0.5"
 
 const (
 	defaultTimeout     = 30 * time.Second
