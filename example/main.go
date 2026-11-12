@@ -1,288 +1,239 @@
+// Command example is a runnable demo of the httpx HTTP client.
+//
+// It walks through a full CRUD cycle against the public JSONPlaceholder
+// API (https://jsonplaceholder.typicode.com), so no setup, API keys, or
+// local server are needed.
+//
+// What it demonstrates:
+//   - Building a client with a base URL, timeout, and default headers
+//   - GET (list with query params, and single item with a path param)
+//   - POST with a JSON body
+//   - PUT (full replace) and PATCH (partial update using pointer fields)
+//   - DELETE with a status check
+//   - Decoding responses into typed structs with httpx.ToJSON
+//
+// Run it:
+//
+//	go run main.go
+//
+// Note: JSONPlaceholder is a fake API. Writes (POST/PUT/PATCH/DELETE) return
+// realistic responses, but nothing is actually persisted.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
-	"os"
-	"strings"
 	"time"
 
 	"github.com/thedevsaddam/httpx"
 )
 
-// A practical, runnable tour of the httpx package.
-// Run from a project where github.com/thedevsaddam/httpx is your module path:
-//   go run main.go
-//
-// These examples use https://httpbin.org, a public HTTP testing service.
-// Network access is required. Each example reports its own errors so one
-// failed demo does not prevent the remaining examples from running.
+const (
+	baseURL     = "https://jsonplaceholder.typicode.com"
+	listLimit   = 5
+	exampleID   = 1
+	exampleUser = 1
+)
 
+// Todo represents a JSONPlaceholder todo resource.
 type Todo struct {
-	UserID    int    `json:"userId"`
 	ID        int    `json:"id"`
+	UserID    int    `json:"userId"`
 	Title     string `json:"title"`
 	Completed bool   `json:"completed"`
 }
 
-type HTTPBinResponse struct {
-	Args    map[string]any    `json:"args"`
-	Data    string            `json:"data"`
-	Files   map[string]string `json:"files"`
-	Form    map[string]string `json:"form"`
-	Headers map[string]string `json:"headers"`
-	JSON    map[string]any    `json:"json"`
-	Method  string            `json:"method"`
-	URL     string            `json:"url"`
+// CreateTodo is the payload for creating a todo.
+type CreateTodo struct {
+	UserID    int    `json:"userId"`
+	Title     string `json:"title"`
+	Completed bool   `json:"completed"`
 }
 
-func main() {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
+// UpdateTodo is the payload for replacing a todo (PUT).
+// Every field is sent, so a PUT overwrites the whole resource.
+type UpdateTodo struct {
+	ID        int    `json:"id"`
+	UserID    int    `json:"userId"`
+	Title     string `json:"title"`
+	Completed bool   `json:"completed"`
+}
 
-	// Configure a reusable client once. Requests can share this client safely.
-	client := httpx.New(
-		httpx.WithBaseURL("https://httpbin.org"),
-		httpx.WithTimeout(12*time.Second),
-		httpx.WithHeader("Accept", "application/json"),
-		httpx.WithClientName("httpx-example"),
-		httpx.WithPoolConfig(httpx.PoolConfig{
-			MaxIdleConns:          100,
-			MaxIdleConnsPerHost:   10,
-			MaxConnsPerHost:       20,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   5 * time.Second,
-			ResponseHeaderTimeout: 8 * time.Second,
-		}),
-		httpx.WithMaxResponseBytes(2<<20), // 2 MiB for helper reads such as ToJSON.
-		httpx.WithRetryPolicy(httpx.RetryPolicy{
-			MaxAttempts:          3, // Includes the first attempt.
-			InitialBackoff:       150 * time.Millisecond,
-			MaxBackoff:           time.Second,
-			RetryableStatusCodes: []int{http.StatusTooManyRequests, 502, 503, 504},
-			RetryNetworkErrors:   true,
-		}),
-		httpx.WithRequestHook(func(ctx context.Context, req *http.Request) {
-			// Hooks run for each network attempt. Keep them quick and concurrency-safe.
-			log.Printf("--> %s %s", req.Method, req.URL.Redacted())
-		}),
-		httpx.WithResponseHook(func(ctx context.Context, resp *http.Response) {
-			log.Printf("<-- %s %s", resp.Status, resp.Request.URL.Redacted())
-		}),
+// PatchTodo is the payload for a partial update (PATCH).
+// Pointer fields let us tell an omitted field apart from its zero value,
+// e.g. Completed=false must be sent, while Completed=nil must not.
+type PatchTodo struct {
+	Title     *string `json:"title,omitempty"`
+	Completed *bool   `json:"completed,omitempty"`
+}
+
+// Client is a small typed wrapper around httpx for the todos API.
+type Client struct {
+	*httpx.Client
+}
+
+// NewClient builds a client with a base URL, timeout and default headers.
+func NewClient() *Client {
+	return &Client{
+		httpx.New(
+			httpx.WithBaseURL(baseURL),
+			httpx.WithTimeout(10*time.Second),
+			httpx.WithHeader("Accept", "application/json"),
+		),
+	}
+}
+
+// ListTodos calls GET /todos, optionally filtered with ?userId=<userID>.
+// Pass 0 to skip the filter. Results are capped by listLimit.
+func (c *Client) ListTodos(ctx context.Context, userID int) ([]Todo, error) {
+	req := c.GET("/todos").QueryParam("_limit", fmt.Sprint(listLimit))
+
+	if userID > 0 {
+		req = req.QueryParam("userId", fmt.Sprint(userID))
+	}
+
+	return httpx.ToJSON[[]Todo](req.Do(ctx))
+}
+
+// GetTodo calls GET /todos/{id}.
+func (c *Client) GetTodo(ctx context.Context, id int) (Todo, error) {
+	return httpx.ToJSON[Todo](
+		c.GET("/todos/{id}").PathParam("id", fmt.Sprint(id)).Do(ctx),
 	)
-
-	runExample("GET with query parameters", func() { getExample(ctx, client) })
-	runExample("POST JSON", func() { postJSONExample(ctx, client) })
-	runExample("request-specific headers and timeout", func() { headersExample(ctx, client) })
-	runExample("PUT, PATCH, and DELETE", func() { methodsExample(ctx, client) })
-	runExample("typed HTTP errors", func() { httpErrorExample(ctx, client) })
-	runExample("manual response handling", func() { manualResponseExample(ctx, client) })
-	runExample("stream response to a file", func() { streamingExample(ctx, client) })
-	runExample("request trace debugging", func() { debugExample(ctx, client) })
-	runExample("multipart upload", func() { uploadExample(ctx, client) })
-	runExample("raw text body", func() { rawBodyExample(ctx, client) })
 }
 
-func runExample(name string, fn func()) {
-	fmt.Printf("\n=== %s ===\n", name)
-	fn()
+// CreateTodo calls POST /todos.
+func (c *Client) CreateTodo(ctx context.Context, input CreateTodo) (Todo, error) {
+	return httpx.ToJSON[Todo](
+		c.POST("/todos").JSON(input).Do(ctx),
+	)
 }
 
-func getExample(ctx context.Context, client *httpx.Client) {
-	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.GET("/get").
-			QueryParam("name", "Jane Doe").
-			QueryParam("page", "2").
-			QueryParam("tag", "go").
-			QueryParam("tag", "httpx").
+// UpdateTodo calls PUT /todos/{id} (full replacement).
+func (c *Client) UpdateTodo(ctx context.Context, id int, input UpdateTodo) (Todo, error) {
+	return httpx.ToJSON[Todo](
+		c.PUT("/todos/{id}").
+			PathParam("id", fmt.Sprint(id)).
+			JSON(input).
 			Do(ctx),
 	)
-	if err != nil {
-		log.Printf("GET failed: %v", err)
-		return
-	}
-	fmt.Printf("URL:  %s\nArgs: %#v\n", result.URL, result.Args)
-
-	// For a map of single values, use .QueryParams(map[string]string{...}).
 }
 
-func postJSONExample(ctx context.Context, client *httpx.Client) {
-	payload := map[string]any{
-		"name":  "Jane Doe",
-		"email": "jane@example.com",
-		"roles": []string{"developer", "admin"},
-	}
-	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.
-			POST("/anything/users").
-			Header("Idempotency-Key", "order-12345").
-			JSON(payload).
-			Retryable().
+// PatchTodo calls PATCH /todos/{id} (partial update).
+func (c *Client) PatchTodo(ctx context.Context, id int, input PatchTodo) (Todo, error) {
+	return httpx.ToJSON[Todo](
+		c.PATCH("/todos/{id}").
+			PathParam("id", fmt.Sprint(id)).
+			JSON(input).
 			Do(ctx),
 	)
-	if err != nil {
-		log.Printf("POST failed: %v", err)
-		return
-	}
-	fmt.Printf("Method: %s\nURL: %s\nJSON: %#v\n", result.Method, result.URL, result.JSON)
 }
 
-func headersExample(ctx context.Context, client *httpx.Client) {
-	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.GET("/anything/headers").
-			Header("X-Request-ID", "demo-123").
-			Header("X-Environment", "local").
-			Timeout(4 * time.Second).
-			Do(ctx),
-	)
+// DeleteTodo calls DELETE /todos/{id}.
+func (c *Client) DeleteTodo(ctx context.Context, id int) error {
+	resp, err := c.DELETE("/todos/{id}").PathParam("id", fmt.Sprint(id)).Do(ctx)
 	if err != nil {
-		log.Printf("Headers example failed: %v", err)
-		return
-	}
-	fmt.Printf("Returned headers: %#v\n", result.Headers)
-}
-
-func methodsExample(ctx context.Context, client *httpx.Client) {
-	payload := map[string]string{"name": "Updated item"}
-	requests := []struct {
-		method string
-		do     func() (*httpx.Response, error)
-	}{
-		{"PUT", func() (*httpx.Response, error) { return client.PUT("/anything/items/42").JSON(payload).Do(ctx) }},
-		{"PATCH", func() (*httpx.Response, error) { return client.PATCH("/anything/items/42").JSON(payload).Do(ctx) }},
-		{"DELETE", func() (*httpx.Response, error) { return client.DELETE("/anything/items/42").Do(ctx) }},
-	}
-	for _, item := range requests {
-		resp, err := item.do()
-		if err != nil {
-			log.Printf("%s failed: %v", item.method, err)
-			continue
-		}
-		fmt.Printf("%s -> %s\n", item.method, resp.Status)
-		_ = resp.Close()
-	}
-}
-
-func httpErrorExample(ctx context.Context, client *httpx.Client) {
-	// /status/404 intentionally returns a non-2xx response.
-	_, err := httpx.ToJSON[HTTPBinResponse](client.GET("/status/404").Do(ctx))
-	if err == nil {
-		log.Printf("expected a 404 error, got nil")
-		return
-	}
-	var httpErr *httpx.HTTPError
-	if errors.As(err, &httpErr) {
-		fmt.Printf("Status: %d (%s)\nURL: %s\nBody excerpt: %s\n",
-			httpErr.StatusCode, httpErr.Status, httpErr.URL, httpErr.Body)
-		return
-	}
-	log.Printf("request failed for another reason: %v", err)
-}
-
-func manualResponseExample(ctx context.Context, client *httpx.Client) {
-	resp, err := client.GET("/status/200").Do(ctx)
-	if err != nil {
-		log.Printf("Manual response failed: %v", err)
-		return
-	}
-	defer resp.Close() // Always close manually handled response bodies.
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Read body failed: %v", err)
-		return
-	}
-	fmt.Printf("Status: %s | success: %t | body: %s\n", resp.Status, resp.IsSuccess(), body)
-}
-
-func streamingExample(ctx context.Context, client *httpx.Client) {
-	// CopyTo streams the body instead of buffering the whole response in memory.
-	// It closes the response body when the copy finishes.
-	file, err := os.CreateTemp("", "httpx-download-*.bin")
-	if err != nil {
-		log.Printf("Create output file failed: %v", err)
-		return
-	}
-	path := file.Name()
-	defer os.Remove(path)
-	defer file.Close()
-
-	resp, err := client.GET("/bytes/65536").Do(ctx) // 64 KiB test payload.
-	if err != nil {
-		log.Printf("Download request failed: %v", err)
-		return
-	}
-	if !resp.IsSuccess() {
-		fmt.Printf("Download returned %s\n", resp.Status)
-		_ = resp.Close()
-		return
-	}
-	n, err := resp.CopyTo(file)
-	if err != nil {
-		log.Printf("Stream copy failed: %v", err)
-		return
-	}
-	fmt.Printf("Streamed %d bytes to %s\n", n, path)
-}
-
-func debugExample(ctx context.Context, client *httpx.Client) {
-	resp, err := client.GET("/get").QueryParam("debug", "true").Debug().Do(ctx)
-	if err != nil {
-		log.Printf("Debug request failed: %v", err)
-		return
+		return err
 	}
 	defer resp.Close()
 
-	trace := resp.Trace()
-	fmt.Printf("Method=%s status=%d total=%s reused_connection=%t\n",
-		trace.Method, trace.StatusCode, trace.TotalTime, trace.IsConnReused)
+	if !resp.IsSuccess() {
+		return fmt.Errorf("delete todo failed: HTTP %s", resp.Status)
+	}
+
+	return nil
 }
 
-func uploadExample(ctx context.Context, client *httpx.Client) {
-	file, err := os.CreateTemp("", "httpx-upload-*.txt")
-	if err != nil {
-		log.Printf("Create upload file failed: %v", err)
-		return
+func main() {
+	if err := run(); err != nil {
+		log.Fatal(err)
 	}
-	path := file.Name()
-	defer os.Remove(path)
-	if _, err := file.WriteString("Hello from httpx multipart upload!\n"); err != nil {
-		_ = file.Close()
-		log.Printf("Write upload file failed: %v", err)
-		return
-	}
-	if err := file.Close(); err != nil {
-		log.Printf("Close upload file failed: %v", err)
-		return
-	}
-
-	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.POST("/post").
-			Field("description", "example upload").
-			File("file", path).
-			Do(ctx),
-	)
-	if err != nil {
-		log.Printf("Upload failed: %v", err)
-		return
-	}
-	fmt.Printf("Upload accepted: method=%s form=%#v files=%#v\n", result.Method, result.Form, result.Files)
 }
 
-func rawBodyExample(ctx context.Context, client *httpx.Client) {
-	result, err := httpx.ToJSON[HTTPBinResponse](
-		client.POST("/anything/raw").
-			Header("Content-Type", "text/plain; charset=utf-8").
-			Body(strings.NewReader("plain text payload from httpx")).
-			Do(ctx),
-	)
+// run holds the demo so deferred cleanup (cancel) always executes;
+// log.Fatal in main would skip defers.
+func run() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	client := NewClient()
+
+	// 1. LIST
+	section("LIST TODOS")
+
+	todos, err := client.ListTodos(ctx, exampleUser)
 	if err != nil {
-		log.Printf("Raw body request failed: %v", err)
-		return
+		return fmt.Errorf("ListTodos: %w", err)
 	}
-	fmt.Printf("Method: %s\nData: %q\n", result.Method, result.Data)
+	for _, t := range todos {
+		fmt.Printf("ID: %d | User: %d | Title: %s | Completed: %t\n",
+			t.ID, t.UserID, t.Title, t.Completed)
+	}
+
+	// 2. GET
+	section("GET TODO")
+
+	todo, err := client.GetTodo(ctx, exampleID)
+	if err != nil {
+		return fmt.Errorf("GetTodo: %w", err)
+	}
+	fmt.Printf("%+v\n", todo)
+
+	// 3. CREATE
+	section("CREATE TODO")
+
+	created, err := client.CreateTodo(ctx, CreateTodo{
+		UserID:    exampleUser,
+		Title:     "Learn Go HTTP client",
+		Completed: false,
+	})
+	if err != nil {
+		return fmt.Errorf("CreateTodo: %w", err)
+	}
+	fmt.Printf("Created: %+v\n", created)
+
+	// 4. UPDATE (PUT: complete replacement)
+	section("UPDATE TODO")
+
+	updated, err := client.UpdateTodo(ctx, exampleID, UpdateTodo{
+		ID:        exampleID,
+		UserID:    exampleUser,
+		Title:     "Learn Go and REST APIs",
+		Completed: true,
+	})
+	if err != nil {
+		return fmt.Errorf("UpdateTodo: %w", err)
+	}
+	fmt.Printf("Updated: %+v\n", updated)
+
+	// 5. PATCH (partial update)
+	section("PATCH TODO")
+
+	newTitle := "Learn Go with httpx"
+	completed := false
+
+	patched, err := client.PatchTodo(ctx, exampleID, PatchTodo{
+		Title:     &newTitle,
+		Completed: &completed,
+	})
+	if err != nil {
+		return fmt.Errorf("PatchTodo: %w", err)
+	}
+	fmt.Printf("Patched: %+v\n", patched)
+
+	// 6. DELETE
+	section("DELETE TODO")
+
+	if err := client.DeleteTodo(ctx, exampleID); err != nil {
+		return fmt.Errorf("DeleteTodo: %w", err)
+	}
+	fmt.Println("Todo deleted successfully")
+
+	return nil
+}
+
+// section prints a banner so each step is easy to find in the output.
+func section(title string) {
+	fmt.Printf("\n========== %s ==========\n", title)
 }
